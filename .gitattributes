@@ -1,0 +1,14 @@
+# Normalizace konců řádků: LF v repozitáři, CRLF na Windows při checkoutu
+* text=auto eol=lf
+
+# Binární soubory – žádná konverze
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.icns binary
+*.pdf binary
+*.exe binary
+*.msi binary
+*.zip binary
+*.lock text eol=lf

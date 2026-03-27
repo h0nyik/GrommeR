@@ -1,0 +1,1070 @@
+"use client";
+
+import { useCallback, useState } from "react";
+import {
+  createPageInfoFromDimensionsMm,
+  createPdfFromImage,
+  getImageDimensionsMm,
+  isSupportedImageType,
+} from "@/lib/image-to-pdf";
+import { generateOutputFilename } from "@/lib/output-filename";
+import {
+  addGrommetMarksToPdf,
+  getPageInfo,
+  loadPdfDocument,
+} from "@/lib/pdf-utils";
+import type {
+  Edge,
+  GrommetMarksParams,
+  MarkColor,
+  PdfPageInfo,
+} from "@/types/grommet";
+import { track } from "@/lib/analytics";
+import {
+  chooseOutputFolderViaTauri,
+  isTauri,
+  openFilesViaTauri,
+  saveBlobToFolder,
+  saveBlobViaTauri,
+  type OverwriteStrategy,
+} from "@/lib/tauri-bridge";
+import { ImagePreview } from "./ImagePreview";
+import { PdfBoxesSection } from "./PdfBoxesSection";
+import { PdfPreview } from "./PdfPreview";
+
+const EDGES: { value: Edge; label: string }[] = [
+  { value: "top", label: "Horní" },
+  { value: "bottom", label: "Dolní" },
+  { value: "left", label: "Levá" },
+  { value: "right", label: "Pravá" },
+];
+
+const MAX_BATCH_FILES = 10;
+
+type BatchStatus = "loading" | "ready" | "processing" | "done" | "error";
+
+interface BatchItem {
+  id: string;
+  file: File;
+  bytes: ArrayBuffer | null;
+  pageInfo: PdfPageInfo | null;
+  status: BatchStatus;
+  error: string | null;
+  outputNameOverride: string;
+}
+
+function clamp(min: number, max: number, value: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+const UNITS = [
+  { value: "mm", label: "mm", toMm: (v: number) => v },
+  { value: "cm", label: "cm", toMm: (v: number) => v * 10 },
+  { value: "in", label: "palce", toMm: (v: number) => v * 25.4 },
+] as const;
+
+/** První tři = nejpoužívanější (M100, K100, C100), zbytek základní CMYK paletka. */
+const CMYK_PRESETS = [
+  { name: "M100", c: 0, m: 100, y: 0, k: 0 },
+  { name: "K100", c: 0, m: 0, y: 0, k: 100 },
+  { name: "C100", c: 100, m: 0, y: 0, k: 0 },
+  { name: "Y100", c: 0, m: 0, y: 100, k: 0 },
+  { name: "C100 M100", c: 100, m: 100, y: 0, k: 0 },
+  { name: "M100 Y100", c: 0, m: 100, y: 100, k: 0 },
+  { name: "C100 Y100", c: 100, m: 0, y: 100, k: 0 },
+  { name: "K80", c: 0, m: 0, y: 0, k: 80 },
+];
+
+function cmykToRgbHex(c: number, m: number, y: number, k: number): string {
+  const r = Math.round(255 * (1 - c / 100) * (1 - k / 100));
+  const g = Math.round(255 * (1 - m / 100) * (1 - k / 100));
+  const b = Math.round(255 * (1 - y / 100) * (1 - k / 100));
+  return `#${[r, g, b].map((x) => x.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** Hex → HSL (h 0–360, s/l 0–100). */
+function hexToHsl(hex: string): { h: number; s: number; l: number } {
+  const { r, g, b } = hexToRgb(hex);
+  const R = r, G = g, B = b;
+  const max = Math.max(R, G, B), min = Math.min(R, G, B);
+  let h = 0, s = 0;
+  const l = (max + min) / 2;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === R) h = ((G - B) / d + (G < B ? 6 : 0)) / 6;
+    else if (max === G) h = ((B - R) / d + 2) / 6;
+    else h = ((R - G) / d + 4) / 6;
+  }
+  return { h: h * 360, s: s * 100, l: l * 100 };
+}
+
+/** HSL → RGB (0–1). */
+function hslToRgb(h: number, s: number, l: number): { r: number; g: number; b: number } {
+  h = h / 360; s = s / 100; l = l / 100;
+  let r = l, g = l, b = l;
+  if (s > 0) {
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    r = hue2rgb(p, q, h + 1/3);
+    g = hue2rgb(p, q, h);
+    b = hue2rgb(p, q, h - 1/3);
+  }
+  return { r, g, b };
+}
+function hue2rgb(p: number, q: number, t: number): number {
+  if (t < 0) t += 1; if (t > 1) t -= 1;
+  if (t < 1/6) return p + (q - p) * 6 * t;
+  if (t < 1/2) return q;
+  if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+  return p;
+}
+
+/** RGB (0–1) → CMYK (0–100). Bez černé: K vynulujeme a rozložíme do C,M,Y (pro doporučení vždy barevně). */
+function rgbToCmykNoK(r: number, g: number, b: number): { c: number; m: number; y: number; k: number } {
+  const k = 1 - Math.max(r, g, b);
+  if (k >= 0.99) return { c: 0, m: 100, y: 0, k: 0 };
+  const c = (1 - r - k) / (1 - k) || 0;
+  const m = (1 - g - k) / (1 - k) || 0;
+  const y = (1 - b - k) / (1 - k) || 0;
+  return { c: Math.round(c * 100), m: Math.round(m * 100), y: Math.round(y * 100), k: 0 };
+}
+
+/** Doplňková barva k hex (naproti na barevném kole) + invertovaná světlost pro kontrast. Bez černé → vrací CMYK. */
+function complementaryCmyk(bgHex: string): { c: number; m: number; y: number; k: number } {
+  const hsl = hexToHsl(bgHex);
+  const compH = (hsl.h + 180) % 360;
+  const compL = hsl.l < 50 ? 85 : 25;
+  const compS = Math.min(100, hsl.s + 30);
+  const rgb = hslToRgb(compH, compS, compL);
+  return rgbToCmykNoK(rgb.r, rgb.g, rgb.b);
+}
+
+/** Popisek CMYK (zkratky C/M/Y/K s procenty). */
+function cmykLabel(c: number, m: number, y: number, k: number): string {
+  const parts: string[] = [];
+  if (c > 0) parts.push(`C${c}`);
+  if (m > 0) parts.push(`M${m}`);
+  if (y > 0) parts.push(`Y${y}`);
+  if (k > 0) parts.push(`K${k}`);
+  return parts.length ? parts.join(" ") : "bílá (papír)";
+}
+
+/** Mapka kontrastů: pozadí → doporučená barva vždy naproti v barevném spektru (bez černé). */
+const CONTRAST_MAP: { bgHex: string; bgLabel: string }[] = [
+  { bgHex: "#6b7c3d", bgLabel: "olivová" },
+  { bgHex: "#722f37", bgLabel: "burgundská" },
+  { bgHex: "#2d6b6b", bgLabel: "teal" },
+  { bgHex: "#4a3a5c", bgLabel: "tmavě fialová" },
+  { bgHex: "#c9a227", bgLabel: "hořčice" },
+  { bgHex: "#c4a574", bgLabel: "béžová / písek" },
+  { bgHex: "#7ba3c9", bgLabel: "pastelová modrá" },
+  { bgHex: "#a65d34", bgLabel: "terakota" },
+  { bgHex: "#5c6b5c", bgLabel: "šedozelená" },
+  { bgHex: "#b07d82", bgLabel: "dusty rose" },
+];
+
+function hexToRgb(hex: string): { r: number; g: number; b: number } {
+  const m = hex.match(/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i);
+  if (!m) return { r: 0, g: 0, b: 0 };
+  return {
+    r: parseInt(m[1], 16) / 255,
+    g: parseInt(m[2], 16) / 255,
+    b: parseInt(m[3], 16) / 255,
+  };
+}
+
+export function GrommetForm() {
+  const [file, setFile] = useState<File | null>(null);
+  const [fileBytes, setFileBytes] = useState<ArrayBuffer | null>(null);
+  const [pageInfo, setPageInfo] = useState<PdfPageInfo | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [processing, setProcessing] = useState(false);
+  const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
+
+  const [edges, setEdges] = useState<Edge[]>(["top", "bottom", "left", "right"]);
+  const [offsetX, setOffsetX] = useState(2.8);
+  const [offsetY, setOffsetY] = useState(2.8);
+  const [unit, setUnit] = useState<"mm" | "cm" | "in">("cm");
+  const [mode, setMode] = useState<"count" | "spacing">("spacing");
+  const [countPerEdge, setCountPerEdge] = useState(5);
+  const [spacing, setSpacing] = useState(48);
+  const [shape, setShape] = useState<"circle" | "square">("circle");
+  const [size, setSize] = useState(7);
+  const [colorSpace, setColorSpace] = useState<"rgb" | "cmyk">("cmyk");
+  const [colorHex, setColorHex] = useState("#000000");
+  const [cmykC, setCmykC] = useState(0);
+  const [cmykM, setCmykM] = useState(100);
+  const [cmykY, setCmykY] = useState(0);
+  const [cmykK, setCmykK] = useState(0);
+  const [defaultSaveDir, setDefaultSaveDir] = useState<string | null>(null);
+  const [outputFolder, setOutputFolder] = useState<string | null>(null);
+  const [overwriteStrategy, setOverwriteStrategy] = useState<OverwriteStrategy>("overwrite");
+
+  const getMarkColor = (): MarkColor =>
+    colorSpace === "rgb"
+      ? { type: "rgb", ...hexToRgb(colorHex) }
+      : {
+          type: "cmyk",
+          c: cmykC / 100,
+          m: cmykM / 100,
+          y: cmykY / 100,
+          k: cmykK / 100,
+        };
+
+  const loadOneBatchItem = useCallback(
+    async (item: BatchItem): Promise<BatchItem> => {
+      const isPdf = item.file.type === "application/pdf";
+      const isImage = isSupportedImageType(item.file.type);
+      try {
+        const bytes = await item.file.arrayBuffer();
+        let info: PdfPageInfo | null = null;
+        if (isPdf) {
+          const doc = await loadPdfDocument(bytes);
+          const pages = doc.getPages();
+          if (pages.length === 0) return { ...item, bytes, status: "error", error: "Žádná stránka." };
+          info = getPageInfo(pages[0], 0);
+        } else {
+          const dim = await getImageDimensionsMm(bytes, item.file.type as "image/jpeg" | "image/png");
+          info = createPageInfoFromDimensionsMm(dim.widthMm, dim.heightMm);
+        }
+        return { ...item, bytes, pageInfo: info, status: "ready", error: null };
+      } catch (err) {
+        return { ...item, bytes: null, status: "error", error: err instanceof Error ? err.message : "Chyba načtení." };
+      }
+    },
+    []
+  );
+
+  const applySelectedFiles = useCallback(
+    async (files: File[]) => {
+      setError(null);
+      setPageInfo(null);
+      setFileBytes(null);
+      setFile(null);
+      setBatchItems([]);
+
+      if (files.length === 0) return;
+      if (files.length > MAX_BATCH_FILES) {
+        setError(`Maximálně ${MAX_BATCH_FILES} souborů.`);
+        return;
+      }
+
+      const valid = files.every(
+        (f) => f.type === "application/pdf" || isSupportedImageType(f.type)
+      );
+      if (!valid) {
+        setError("Pouze PDF nebo obrázky (JPG, PNG).");
+        return;
+      }
+
+      if (files.length === 1) {
+        const f = files[0];
+        setFile(f);
+        try {
+          const bytes = await f.arrayBuffer();
+          setFileBytes(bytes);
+          if (f.type === "application/pdf") {
+            const doc = await loadPdfDocument(bytes);
+            const pages = doc.getPages();
+            if (pages.length === 0) {
+              setError("PDF neobsahuje žádnou stránku.");
+              return;
+            }
+            setPageInfo(getPageInfo(pages[0], 0));
+          } else {
+            const dim = await getImageDimensionsMm(bytes, f.type as "image/jpeg" | "image/png");
+            setPageInfo(createPageInfoFromDimensionsMm(dim.widthMm, dim.heightMm));
+          }
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "Nepodařilo se načíst soubor.");
+        }
+        return;
+      }
+
+      const items: BatchItem[] = files.map((file, i) => ({
+        id: `${file.name}-${i}-${Date.now()}`,
+        file,
+        bytes: null,
+        pageInfo: null,
+        status: "loading" as BatchStatus,
+        error: null,
+        outputNameOverride: "",
+      }));
+      setBatchItems(items);
+      const loaded = await Promise.all(items.map(loadOneBatchItem));
+      setBatchItems(loaded);
+    },
+    [loadOneBatchItem]
+  );
+
+  const onFileChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      applySelectedFiles(Array.from(e.target.files ?? []));
+    },
+    [applySelectedFiles]
+  );
+
+  const handleTauriOpenFiles = useCallback(async () => {
+    const result = await openFilesViaTauri({
+      multiple: true,
+      accept: "application/pdf,image/jpeg,image/png",
+    });
+    if (result?.files.length) {
+      if (result.defaultSaveDir) {
+        setDefaultSaveDir(result.defaultSaveDir);
+        // Předvyplnit výstupní složku adresářem zdrojových souborů (lze přepsat)
+        setOutputFolder((prev) => prev ?? result.defaultSaveDir);
+      }
+      applySelectedFiles(result.files);
+    }
+  }, [applySelectedFiles]);
+
+  const handleChooseOutputFolder = useCallback(async () => {
+    const folder = await chooseOutputFolderViaTauri();
+    if (folder) setOutputFolder(folder);
+  }, []);
+
+  const toggleEdge = (edge: Edge) => {
+    setEdges((prev) =>
+      prev.includes(edge) ? prev.filter((e) => e !== edge) : [...prev, edge]
+    );
+  };
+
+  const offsetToMm = UNITS.find((u) => u.value === unit)!.toMm;
+
+  const handleBatchSubmit = async () => {
+    const ready = batchItems.filter((i) => i.status === "ready" && i.bytes && i.pageInfo);
+    if (ready.length === 0) return;
+    setProcessing(true);
+    setError(null);
+    const offsetXMm = offsetToMm(offsetX);
+    const offsetYMm = offsetToMm(offsetY);
+    let spacingCm: number;
+    let spacingVertCm: number | undefined;
+    if (mode === "spacing") {
+      spacingCm = spacing;
+    } else {
+      const count = Math.max(1, countPerEdge);
+      spacingVertCm = undefined;
+      spacingCm = 0;
+      if (ready[0].pageInfo && count > 1) {
+        const horzMm = (ready[0].pageInfo.widthMm - 2 * offsetXMm) / (count - 1);
+        spacingCm = horzMm / 10;
+      }
+    }
+
+    for (let idx = 0; idx < ready.length; idx++) {
+      const item = ready[idx];
+      if (!item.bytes || !item.pageInfo) continue;
+      setBatchItems((prev) =>
+        prev.map((i) => (i.id === item.id ? { ...i, status: "processing" as BatchStatus } : i))
+      );
+      try {
+        let pdfBytes: ArrayBuffer | Uint8Array = item.bytes;
+        if (isSupportedImageType(item.file.type)) {
+          pdfBytes = await createPdfFromImage(
+            item.bytes,
+            item.file.type as "image/jpeg" | "image/png"
+          );
+        }
+        const params: GrommetMarksParams = {
+          widthMm: item.pageInfo.widthMm,
+          heightMm: item.pageInfo.heightMm,
+          edges,
+          offsetXMm,
+          offsetYMm,
+          mode,
+          countPerEdge: mode === "count" ? countPerEdge : undefined,
+          spacingMm: mode === "spacing" ? spacing * 10 : undefined,
+        };
+        const result = await addGrommetMarksToPdf(
+          pdfBytes,
+          params,
+          { shape, sizeMm: size, borderColor: getMarkColor() }
+        );
+        const outputName =
+          item.outputNameOverride.trim() ||
+          generateOutputFilename({
+            originalFileName: item.file.name,
+            widthMm: item.pageInfo.widthMm,
+            heightMm: item.pageInfo.heightMm,
+            spacingCm,
+            spacingVertCm,
+          });
+        const ab = new ArrayBuffer(result.byteLength);
+        new Uint8Array(ab).set(result);
+        const blob = new Blob([ab], { type: "application/pdf" });
+        if (isTauri()) {
+          // Pokud je vybrána výstupní složka, uložíme přímo bez dialogu (strategie přepisu)
+          const folder = outputFolder ?? defaultSaveDir;
+          let saved = false;
+          if (folder) {
+            const savedPath = await saveBlobToFolder(blob, folder, outputName, overwriteStrategy);
+            saved = savedPath !== null;
+            if (!saved && overwriteStrategy === "skip") {
+              // soubor byl úmyslně přeskočen – berme to jako úspěch
+              saved = true;
+            }
+          }
+          if (!saved) {
+            const dialSaved = await saveBlobViaTauri(blob, outputName, folder);
+            if (!dialSaved) {
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              a.href = url;
+              a.download = outputName;
+              a.click();
+              URL.revokeObjectURL(url);
+            }
+          }
+        } else {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = outputName;
+          a.click();
+          URL.revokeObjectURL(url);
+        }
+        setBatchItems((prev) =>
+          prev.map((i) => (i.id === item.id ? { ...i, status: "done" as BatchStatus } : i))
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Chyba";
+        track({ type: "error", message: msg, context: "batch" });
+        setBatchItems((prev) =>
+          prev.map((i) =>
+            i.id === item.id
+              ? { ...i, status: "error" as BatchStatus, error: msg }
+              : i
+          )
+        );
+      }
+    }
+    track({ type: "batch_generated", count: ready.length });
+    setProcessing(false);
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (batchItems.length > 0) {
+      handleBatchSubmit();
+      return;
+    }
+    if (!fileBytes || !pageInfo || !file) {
+      setError("Nejprve nahrajte PDF nebo obrázek.");
+      return;
+    }
+    setError(null);
+    setProcessing(true);
+    try {
+      let pdfBytes: ArrayBuffer | Uint8Array = fileBytes;
+      if (isSupportedImageType(file.type)) {
+        pdfBytes = await createPdfFromImage(
+          fileBytes,
+          file.type as "image/jpeg" | "image/png"
+        );
+      }
+      const params: GrommetMarksParams = {
+        widthMm: pageInfo.widthMm,
+        heightMm: pageInfo.heightMm,
+        edges,
+        offsetXMm: offsetToMm(offsetX),
+        offsetYMm: offsetToMm(offsetY),
+        mode,
+        countPerEdge: mode === "count" ? countPerEdge : undefined,
+        spacingMm: mode === "spacing" ? spacing * 10 : undefined,
+      };
+      const result = await addGrommetMarksToPdf(
+        pdfBytes,
+        params,
+        {
+          shape,
+          sizeMm: size,
+          borderColor: getMarkColor(),
+        }
+      );
+      const offsetXMm = offsetToMm(offsetX);
+      const offsetYMm = offsetToMm(offsetY);
+      let spacingCm: number;
+      let spacingVertCm: number | undefined;
+      if (mode === "spacing") {
+        spacingCm = spacing;
+      } else {
+        const count = Math.max(1, countPerEdge);
+        const horzMm = count > 1 ? (pageInfo.widthMm - 2 * offsetXMm) / (count - 1) : 0;
+        const vertMm = count > 1 ? (pageInfo.heightMm - 2 * offsetYMm) / (count - 1) : 0;
+        spacingCm = horzMm / 10;
+        spacingVertCm = Math.abs(vertMm / 10 - spacingCm) < 0.5 ? undefined : vertMm / 10;
+      }
+
+      const outputName = generateOutputFilename({
+        originalFileName: file?.name ?? "vystup.pdf",
+        widthMm: pageInfo.widthMm,
+        heightMm: pageInfo.heightMm,
+        spacingCm,
+        spacingVertCm,
+      });
+
+      const ab = new ArrayBuffer(result.byteLength);
+      new Uint8Array(ab).set(result);
+      const blob = new Blob([ab], { type: "application/pdf" });
+      if (isTauri()) {
+        const folder = outputFolder ?? defaultSaveDir;
+        let saved = false;
+        if (folder) {
+          const savedPath = await saveBlobToFolder(blob, folder, outputName, overwriteStrategy);
+          saved = savedPath !== null || overwriteStrategy === "skip";
+        }
+        if (!saved) {
+          const dialSaved = await saveBlobViaTauri(blob, outputName, folder);
+          if (!dialSaved) {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = outputName;
+            a.click();
+            URL.revokeObjectURL(url);
+          }
+        }
+      } else {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = outputName;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+      track({ type: "pdf_generated", single: true });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Chyba při generování PDF.";
+      track({ type: "error", message: msg, context: "single" });
+      setError(msg);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="mx-auto max-w-2xl space-y-6">
+      {/* Nahrání PDF */}
+      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+        <h2 className="mb-2 text-lg font-semibold text-zinc-800 dark:text-zinc-100">
+          Nahrání souborů
+        </h2>
+        <p className="mb-2 text-sm text-zinc-500 dark:text-zinc-400">
+          Jeden soubor nebo dávka (až {MAX_BATCH_FILES}× PDF / JPG / PNG).
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          {!isTauri() && (
+            <input
+              type="file"
+              accept="application/pdf,image/jpeg,image/png"
+              multiple
+              onChange={onFileChange}
+              className="block flex-1 min-w-0 text-sm text-zinc-600 file:mr-4 file:rounded file:border-0 file:bg-zinc-200 file:px-4 file:py-2 file:text-sm file:font-medium dark:text-zinc-400 file:dark:bg-zinc-700"
+            />
+          )}
+          {isTauri() && (
+            <>
+              <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                V desktopové aplikaci vyberte soubory pouze tímto tlačítkem.
+              </p>
+              <button
+                type="button"
+                onClick={handleTauriOpenFiles}
+                className="rounded border border-zinc-300 bg-zinc-100 px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-200 dark:border-zinc-600 dark:bg-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-600"
+              >
+                Vybrat soubory (systémový dialog)
+              </button>
+            </>
+          )}
+        </div>
+        {file && !batchItems.length && (
+          <>
+            <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
+              Soubor: {file.name}
+              {pageInfo && (
+                <> — {pageInfo.widthMm.toFixed(1)} × {pageInfo.heightMm.toFixed(1)} mm
+                  {file.type.startsWith("image/") && " (obrázek → výstup PDF)"}
+                </>
+              )}
+            </p>
+            <ImagePreview file={file.type.startsWith("image/") ? file : null} />
+            <PdfPreview file={file?.type === "application/pdf" ? file : null} />
+          </>
+        )}
+        {batchItems.length > 0 && (
+          <div className="mt-4">
+            <h3 className="mb-2 text-sm font-medium text-zinc-700 dark:text-zinc-300">
+              Dávka ({batchItems.length} souborů)
+            </h3>
+            <ul className="space-y-2">
+              {batchItems.map((item) => (
+                <li
+                  key={item.id}
+                  className="flex flex-wrap items-center gap-2 rounded border border-zinc-200 bg-zinc-50/50 px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800/50"
+                >
+                  <span className="min-w-[120px] truncate font-medium" title={item.file.name}>
+                    {item.file.name}
+                  </span>
+                  {item.pageInfo && (
+                    <span className="text-zinc-500">
+                      {item.pageInfo.widthMm.toFixed(0)}×{item.pageInfo.heightMm.toFixed(0)} mm
+                    </span>
+                  )}
+                  <span
+                    className={
+                      item.status === "error"
+                        ? "text-red-600 dark:text-red-400"
+                        : item.status === "done"
+                          ? "text-green-600 dark:text-green-400"
+                          : item.status === "processing"
+                            ? "text-blue-600 dark:text-blue-400"
+                            : "text-zinc-500"
+                    }
+                  >
+                    {item.status === "loading" && "načítám…"}
+                    {item.status === "ready" && "připraveno"}
+                    {item.status === "processing" && "zpracovávám…"}
+                    {item.status === "done" && "hotovo"}
+                    {item.status === "error" && (item.error ?? "chyba")}
+                  </span>
+                  {item.status === "ready" && (
+                    <input
+                      type="text"
+                      placeholder="Výstupní název (volitelné)"
+                      value={item.outputNameOverride}
+                      onChange={(e) =>
+                        setBatchItems((prev) =>
+                          prev.map((i) =>
+                            i.id === item.id ? { ...i, outputNameOverride: e.target.value } : i
+                          )
+                        )
+                      }
+                      className="ml-auto min-w-0 max-w-[200px] rounded border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-600 dark:bg-zinc-800"
+                    />
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </section>
+
+      {error && (
+        <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-800 dark:bg-red-900/30 dark:text-red-200">
+          {error}
+        </div>
+      )}
+
+      {/* Hrany */}
+      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+        <h2 className="mb-2 text-lg font-semibold text-zinc-800 dark:text-zinc-100">
+          Hrany pro značky
+        </h2>
+        <div className="flex flex-wrap gap-4">
+          {EDGES.map(({ value, label }) => (
+            <label key={value} className="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                checked={edges.includes(value)}
+                onChange={() => toggleEdge(value)}
+                className="h-4 w-4 rounded border-zinc-300 dark:border-zinc-600"
+              />
+              {label}
+            </label>
+          ))}
+        </div>
+      </section>
+
+      {/* Offset a jednotky */}
+      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+        <h2 className="mb-2 text-lg font-semibold text-zinc-800 dark:text-zinc-100">
+          Offset od rohů
+        </h2>
+        <div className="flex flex-wrap gap-4">
+          <label className="flex items-center gap-2">
+            <span className="text-sm text-zinc-600 dark:text-zinc-400">X:</span>
+            <input
+              type="number"
+              min={0}
+              step="any"
+              value={offsetX}
+              onChange={(e) => setOffsetX(Number(e.target.value) || 0)}
+              className="w-20 rounded border border-zinc-300 px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+            />
+          </label>
+          <label className="flex items-center gap-2">
+            <span className="text-sm text-zinc-600 dark:text-zinc-400">Y:</span>
+            <input
+              type="number"
+              min={0}
+              step="any"
+              value={offsetY}
+              onChange={(e) => setOffsetY(Number(e.target.value) || 0)}
+              className="w-20 rounded border border-zinc-300 px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+            />
+          </label>
+          <label className="flex items-center gap-2">
+            <span className="text-sm text-zinc-600 dark:text-zinc-400">Jednotky:</span>
+            <select
+              value={unit}
+              onChange={(e) => setUnit(e.target.value as "mm" | "cm" | "in")}
+              className="rounded border border-zinc-300 px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+            >
+              {UNITS.map((u) => (
+                <option key={u.value} value={u.value}>
+                  {u.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </section>
+
+      {/* Režim: počet / rozteč */}
+      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+        <h2 className="mb-2 text-lg font-semibold text-zinc-800 dark:text-zinc-100">
+          Počet značek nebo rozteč
+        </h2>
+        <div className="flex flex-wrap gap-6">
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="mode"
+              checked={mode === "count"}
+              onChange={() => setMode("count")}
+            />
+            Počet značek na hranu
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="mode"
+              checked={mode === "spacing"}
+              onChange={() => setMode("spacing")}
+            />
+            Rozteč mezi značkami
+          </label>
+        </div>
+        {mode === "count" ? (
+          <label className="mt-2 flex items-center gap-2">
+            <span className="text-sm text-zinc-600 dark:text-zinc-400">Počet:</span>
+            <input
+              type="number"
+              min={1}
+              value={countPerEdge}
+              onChange={(e) => setCountPerEdge(Number(e.target.value) || 1)}
+              className="w-20 rounded border border-zinc-300 px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+            />
+          </label>
+        ) : (
+          <label className="mt-2 flex items-center gap-2">
+            <span className="text-sm text-zinc-600 dark:text-zinc-400">Rozteč:</span>
+            <input
+              type="number"
+              min={0.1}
+              step="any"
+              value={spacing}
+              onChange={(e) => setSpacing(Number(e.target.value) || 10)}
+              className="w-20 rounded border border-zinc-300 px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+            />
+            <span className="text-sm text-zinc-500">cm</span>
+          </label>
+        )}
+      </section>
+
+      {/* Tvar a velikost značky */}
+      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+        <h2 className="mb-2 text-lg font-semibold text-zinc-800 dark:text-zinc-100">
+          Tvar a velikost značky
+        </h2>
+        <div className="flex flex-wrap gap-6">
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="shape"
+              checked={shape === "circle"}
+              onChange={() => setShape("circle")}
+            />
+            Kruh
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="shape"
+              checked={shape === "square"}
+              onChange={() => setShape("square")}
+            />
+            Čtverec
+          </label>
+          <label className="flex items-center gap-2">
+            <span className="text-sm text-zinc-600 dark:text-zinc-400">Velikost:</span>
+            <input
+              type="number"
+              min={0.5}
+              step="any"
+              value={size}
+              onChange={(e) => setSize(Number(e.target.value) || 1)}
+              className="w-20 rounded border border-zinc-300 px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+            />
+            <span className="text-sm text-zinc-500">mm</span>
+          </label>
+        </div>
+      </section>
+
+      {/* Barva značek */}
+      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+        <h2 className="mb-2 text-lg font-semibold text-zinc-800 dark:text-zinc-100">
+          Barva značek
+        </h2>
+        <div className="mb-3 flex gap-4">
+          <label className="flex cursor-pointer items-center gap-2">
+            <input
+              type="radio"
+              name="colorSpace"
+              checked={colorSpace === "rgb"}
+              onChange={() => setColorSpace("rgb")}
+              className="text-zinc-600"
+            />
+            <span className="text-sm text-zinc-700 dark:text-zinc-300">RGB</span>
+          </label>
+          <label className="flex cursor-pointer items-center gap-2">
+            <input
+              type="radio"
+              name="colorSpace"
+              checked={colorSpace === "cmyk"}
+              onChange={() => setColorSpace("cmyk")}
+              className="text-zinc-600"
+            />
+            <span className="text-sm text-zinc-700 dark:text-zinc-300">CMYK</span>
+          </label>
+        </div>
+        <div className="mb-3 rounded border border-zinc-200 bg-zinc-50/50 p-2 dark:border-zinc-600 dark:bg-zinc-800/30">
+          <p className="mb-2 text-xs font-medium text-zinc-600 dark:text-zinc-400">
+            Mapka kontrastů – barva naproti v spektru (bez černé)
+          </p>
+          <div className="flex flex-wrap gap-3">
+            {CONTRAST_MAP.map((row) => {
+              const rec = complementaryCmyk(row.bgHex);
+              const recLabel = cmykLabel(rec.c, rec.m, rec.y, rec.k);
+              return (
+                <div
+                  key={row.bgHex}
+                  className="flex items-center gap-1.5 rounded bg-white px-2 py-1 shadow-sm dark:bg-zinc-900"
+                >
+                  <span
+                    className="inline-block h-6 w-6 shrink-0 rounded border border-zinc-300 dark:border-zinc-500"
+                    style={{ backgroundColor: row.bgHex }}
+                    title={row.bgLabel}
+                  />
+                  <span className="text-xs text-zinc-500">→</span>
+                  <button
+                    type="button"
+                    title={`Použít: ${recLabel}`}
+                    onClick={() => {
+                      setColorSpace("cmyk");
+                      setCmykC(rec.c);
+                      setCmykM(rec.m);
+                      setCmykY(rec.y);
+                      setCmykK(rec.k);
+                    }}
+                    className="inline-block h-6 w-6 shrink-0 rounded border-2 border-transparent hover:border-zinc-400 dark:hover:border-zinc-500"
+                    style={{
+                      borderRadius: shape === "circle" ? "50%" : 4,
+                      backgroundColor: cmykToRgbHex(rec.c, rec.m, rec.y, rec.k),
+                    }}
+                  />
+                  <span className="text-xs text-zinc-600 dark:text-zinc-300">{recLabel}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <span className="mr-1 text-xs text-zinc-500 dark:text-zinc-400">CMYK paletka:</span>
+          {CMYK_PRESETS.map((preset) => {
+            const hex = cmykToRgbHex(preset.c, preset.m, preset.y, preset.k);
+            const isActive =
+              colorSpace === "cmyk" &&
+              cmykC === preset.c &&
+              cmykM === preset.m &&
+              cmykY === preset.y &&
+              cmykK === preset.k;
+            return (
+              <button
+                key={preset.name}
+                type="button"
+                title={preset.name}
+                onClick={() => {
+                  setColorSpace("cmyk");
+                  setCmykC(preset.c);
+                  setCmykM(preset.m);
+                  setCmykY(preset.y);
+                  setCmykK(preset.k);
+                }}
+                className={`inline-flex shrink-0 items-center justify-center border-2 transition-opacity hover:opacity-90 ${
+                  isActive ? "border-zinc-800 dark:border-zinc-200" : "border-transparent"
+                }`}
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: shape === "circle" ? "50%" : 4,
+                  backgroundColor: hex,
+                }}
+              />
+            );
+          })}
+        </div>
+        {colorSpace === "rgb" ? (
+          <label className="flex items-center gap-2">
+            <input
+              type="color"
+              value={colorHex}
+              onChange={(e) => setColorHex(e.target.value)}
+              className="h-10 w-14 cursor-pointer rounded border border-zinc-300 dark:border-zinc-600"
+            />
+            <span className="text-sm text-zinc-600 dark:text-zinc-400">{colorHex}</span>
+          </label>
+        ) : (
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">C %</span>
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={cmykC}
+                onChange={(e) => setCmykC(clamp(0, 100, Number(e.target.value) || 0))}
+                className="rounded border border-zinc-300 px-2 py-1 dark:border-zinc-600 dark:bg-zinc-800"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">M %</span>
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={cmykM}
+                onChange={(e) => setCmykM(clamp(0, 100, Number(e.target.value) || 0))}
+                className="rounded border border-zinc-300 px-2 py-1 dark:border-zinc-600 dark:bg-zinc-800"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">Y %</span>
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={cmykY}
+                onChange={(e) => setCmykY(clamp(0, 100, Number(e.target.value) || 0))}
+                className="rounded border border-zinc-300 px-2 py-1 dark:border-zinc-600 dark:bg-zinc-800"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">K %</span>
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={cmykK}
+                onChange={(e) => setCmykK(clamp(0, 100, Number(e.target.value) || 0))}
+                className="rounded border border-zinc-300 px-2 py-1 dark:border-zinc-600 dark:bg-zinc-800"
+              />
+            </label>
+          </div>
+        )}
+      </section>
+
+      <PdfBoxesSection
+        pageInfo={
+          batchItems.length > 0
+            ? batchItems.find((i) => i.pageInfo)?.pageInfo ?? null
+            : pageInfo
+        }
+      />
+
+      {/* Výstupní složka a přepis – pouze v desktopové aplikaci (Tauri) */}
+      {isTauri() && (
+        <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="mb-2 text-lg font-semibold text-zinc-800 dark:text-zinc-100">
+            Výstupní složka
+          </h2>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleChooseOutputFolder}
+              className="rounded border border-zinc-300 bg-zinc-100 px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-200 dark:border-zinc-600 dark:bg-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-600"
+            >
+              Vybrat složku…
+            </button>
+            {outputFolder ? (
+              <>
+                <span className="min-w-0 max-w-xs truncate text-sm text-zinc-600 dark:text-zinc-400" title={outputFolder}>
+                  {outputFolder}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setOutputFolder(null)}
+                  className="text-xs text-red-500 hover:underline dark:text-red-400"
+                >
+                  Zrušit
+                </button>
+              </>
+            ) : (
+              <span className="text-sm text-zinc-400 dark:text-zinc-500">
+                {defaultSaveDir ? `Výchozí: ${defaultSaveDir}` : "Nebyla vybrána – každý soubor vyžádá dialog"}
+              </span>
+            )}
+          </div>
+          <div className="mt-3">
+            <span className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+              Při konfliktu názvů:
+            </span>
+            <div className="flex flex-wrap gap-4">
+              {(["overwrite", "suffix", "skip"] as OverwriteStrategy[]).map((s) => (
+                <label key={s} className="flex cursor-pointer items-center gap-2 text-sm">
+                  <input
+                    type="radio"
+                    name="overwriteStrategy"
+                    checked={overwriteStrategy === s}
+                    onChange={() => setOverwriteStrategy(s)}
+                  />
+                  {s === "overwrite" ? "Přepsat" : s === "suffix" ? "Přidat číselný suffix (_1, _2…)" : "Přeskočit"}
+                </label>
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
+
+      <div className="flex justify-end gap-2">
+        <button
+          type="submit"
+          title={
+            processing
+              ? undefined
+              : batchItems.length === 0 && (!fileBytes || !pageInfo)
+                ? "Nejprve nahrajte PDF nebo obrázek (použijte tlačítko „Vybrat soubory“)"
+                : batchItems.length > 0 && !batchItems.some((i) => i.status === "ready")
+                  ? "Počkejte na načtení souborů"
+                  : undefined
+          }
+          disabled={
+            processing ||
+            (batchItems.length === 0 && (!fileBytes || !pageInfo)) ||
+            (batchItems.length > 0 && !batchItems.some((i) => i.status === "ready"))
+          }
+          className="rounded-lg bg-zinc-800 px-6 py-2.5 font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
+        >
+          {processing
+            ? "Generuji…"
+            : batchItems.length > 0
+              ? "Generovat dávku"
+              : "Generovat PDF se značkami"}
+        </button>
+      </div>
+    </form>
+  );
+}

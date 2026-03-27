@@ -128,29 +128,31 @@ export async function saveBlobToFolder(
   }
 }
 
-/** V Tauri otevře dialog pro uložení a zapíše blob na zvolenou cestu; v prohlížeči vrátí false. */
+/**
+ * V Tauri otevře dialog pro uložení a zapíše blob na zvolenou cestu.
+ * Vrátí uloženou cestu, nebo null pokud uživatel zrušil dialog.
+ * Hází výjimku pokud zápis selže (permissions, disk full atd.).
+ */
 export async function saveBlobViaTauri(
   blob: Blob,
   suggestedName: string,
   defaultDir?: string | null
 ): Promise<boolean> {
   if (!isTauri()) return false;
-  try {
-    const { save } = await import("@tauri-apps/plugin-dialog");
-    const { writeFile } = await import("@tauri-apps/plugin-fs");
-    const defaultPath =
-      defaultDir && defaultDir.length > 0
-        ? `${defaultDir.replace(/[/\\]*$/, "")}${defaultDir.includes("/") ? "/" : "\\"}${suggestedName}`
-        : suggestedName;
-    const path = await save({
-      defaultPath,
-      filters: [{ name: "PDF", extensions: ["pdf"] }],
-    });
-    if (path == null) return false;
-    const buf = await blob.arrayBuffer();
-    await writeFile(path, new Uint8Array(buf));
-    return true;
-  } catch {
-    return false;
-  }
+  const { save } = await import("@tauri-apps/plugin-dialog");
+  const { writeFile } = await import("@tauri-apps/plugin-fs");
+  const sep = (defaultDir ?? "").includes("/") ? "/" : "\\";
+  const defaultPath =
+    defaultDir && defaultDir.length > 0
+      ? `${defaultDir.replace(/[/\\]*$/, "")}${sep}${suggestedName}`
+      : suggestedName;
+  const path = await save({
+    defaultPath,
+    filters: [{ name: "PDF", extensions: ["pdf"] }],
+  });
+  if (path == null) return false; // uživatel zrušil dialog – není to chyba
+  const buf = await blob.arrayBuffer();
+  // Pokud writeFile selže, výjimka se propaguje nahoru (volající zobrací chybu)
+  await writeFile(path, new Uint8Array(buf));
+  return true;
 }

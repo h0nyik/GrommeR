@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   createPageInfoFromDimensionsMm,
   createPdfFromImage,
@@ -174,6 +174,20 @@ function hexToRgb(hex: string): { r: number; g: number; b: number } {
   };
 }
 
+/** Stáhne soubor v prohlížeči (web verze). Element je připnut do DOM před kliknutím, URL se revokuje se zpožděním. */
+function downloadBlobInBrowser(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Zpoždění: prohlížeč potřebuje čas na inicializaci stahování před revokací URL
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
 export function GrommetForm() {
   const [file, setFile] = useState<File | null>(null);
   const [fileBytes, setFileBytes] = useState<ArrayBuffer | null>(null);
@@ -200,6 +214,20 @@ export function GrommetForm() {
   const [defaultSaveDir, setDefaultSaveDir] = useState<string | null>(null);
   const [outputFolder, setOutputFolder] = useState<string | null>(null);
   const [overwriteStrategy, setOverwriteStrategy] = useState<OverwriteStrategy>("overwrite");
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  // Tauri detekce přes useEffect – řeší race condition při prvním renderu
+  const [isInTauri, setIsInTauri] = useState(false);
+  const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    setIsInTauri(isTauri());
+  }, []);
+
+  const showSuccess = (msg: string) => {
+    setSuccessMsg(msg);
+    if (successTimerRef.current) clearTimeout(successTimerRef.current);
+    successTimerRef.current = setTimeout(() => setSuccessMsg(null), 8000);
+  };
 
   const getMarkColor = (): MarkColor =>
     colorSpace === "rgb"
@@ -338,6 +366,8 @@ export function GrommetForm() {
     if (ready.length === 0) return;
     setProcessing(true);
     setError(null);
+    setSuccessMsg(null);
+    let batchSuccessCount = 0;
     const offsetXMm = offsetToMm(offsetX);
     const offsetYMm = offsetToMm(offsetY);
     let spacingCm: number;
@@ -395,40 +425,27 @@ export function GrommetForm() {
         const ab = new ArrayBuffer(result.byteLength);
         new Uint8Array(ab).set(result);
         const blob = new Blob([ab], { type: "application/pdf" });
-        if (isTauri()) {
-          // Pokud je vybrána výstupní složka, uložíme přímo bez dialogu (strategie přepisu)
+        if (isInTauri) {
           const folder = outputFolder ?? defaultSaveDir;
-          let saved = false;
           if (folder) {
             const savedPath = await saveBlobToFolder(blob, folder, outputName, overwriteStrategy);
-            saved = savedPath !== null;
-            if (!saved && overwriteStrategy === "skip") {
-              // soubor byl úmyslně přeskočen – berme to jako úspěch
-              saved = true;
+            if (savedPath === null && overwriteStrategy !== "skip") {
+              throw new Error(`Nepodařilo se uložit soubor do složky: ${folder}`);
             }
-          }
-          if (!saved) {
-            const dialSaved = await saveBlobViaTauri(blob, outputName, folder);
+          } else {
+            // Žádná složka není vybrána – otevřeme dialog pro každý soubor
+            const dialSaved = await saveBlobViaTauri(blob, outputName, null);
             if (!dialSaved) {
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement("a");
-              a.href = url;
-              a.download = outputName;
-              a.click();
-              URL.revokeObjectURL(url);
+              throw new Error("Uložení bylo zrušeno nebo selhalo. Vyberte výstupní složku v sekci níže.");
             }
           }
         } else {
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = outputName;
-          a.click();
-          URL.revokeObjectURL(url);
+          downloadBlobInBrowser(blob, outputName);
         }
         setBatchItems((prev) =>
           prev.map((i) => (i.id === item.id ? { ...i, status: "done" as BatchStatus } : i))
         );
+        batchSuccessCount++;
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Chyba";
         track({ type: "error", message: msg, context: "batch" });
@@ -442,6 +459,7 @@ export function GrommetForm() {
       }
     }
     track({ type: "batch_generated", count: ready.length });
+    showSuccess(`Dávka dokončena: ${batchSuccessCount} / ${ready.length} souborů úspěšně zpracováno.`);
     setProcessing(false);
   };
 
@@ -456,6 +474,7 @@ export function GrommetForm() {
       return;
     }
     setError(null);
+    setSuccessMsg(null);
     setProcessing(true);
     try {
       let pdfBytes: ArrayBuffer | Uint8Array = fileBytes;
@@ -506,34 +525,32 @@ export function GrommetForm() {
         spacingVertCm,
       });
 
+      if (!result || result.byteLength < 50) {
+        throw new Error("Vygenerované PDF je prázdné nebo poškozené. Zkuste jiný soubor.");
+      }
+
       const ab = new ArrayBuffer(result.byteLength);
       new Uint8Array(ab).set(result);
       const blob = new Blob([ab], { type: "application/pdf" });
-      if (isTauri()) {
+
+      if (isInTauri) {
         const folder = outputFolder ?? defaultSaveDir;
-        let saved = false;
         if (folder) {
           const savedPath = await saveBlobToFolder(blob, folder, outputName, overwriteStrategy);
-          saved = savedPath !== null || overwriteStrategy === "skip";
-        }
-        if (!saved) {
-          const dialSaved = await saveBlobViaTauri(blob, outputName, folder);
-          if (!dialSaved) {
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = outputName;
-            a.click();
-            URL.revokeObjectURL(url);
+          if (savedPath === null && overwriteStrategy !== "skip") {
+            throw new Error(`Nepodařilo se uložit soubor do složky: ${folder}`);
           }
+          showSuccess(`Soubor uložen: ${savedPath ?? outputName}`);
+        } else {
+          const dialSaved = await saveBlobViaTauri(blob, outputName, null);
+          if (!dialSaved) {
+            throw new Error("Uložení bylo zrušeno nebo selhalo. Vyberte výstupní složku nebo zkuste znovu.");
+          }
+          showSuccess(`Soubor uložen: ${outputName}`);
         }
       } else {
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = outputName;
-        a.click();
-        URL.revokeObjectURL(url);
+        downloadBlobInBrowser(blob, outputName);
+        showSuccess(`Soubor stažen: ${outputName}`);
       }
       track({ type: "pdf_generated", single: true });
     } catch (err) {
@@ -556,7 +573,7 @@ export function GrommetForm() {
           Jeden soubor nebo dávka (až {MAX_BATCH_FILES}× PDF / JPG / PNG).
         </p>
         <div className="flex flex-wrap items-center gap-2">
-          {!isTauri() && (
+          {!isInTauri && (
             <input
               type="file"
               accept="application/pdf,image/jpeg,image/png"
@@ -565,7 +582,7 @@ export function GrommetForm() {
               className="block flex-1 min-w-0 text-sm text-zinc-600 file:mr-4 file:rounded file:border-0 file:bg-zinc-200 file:px-4 file:py-2 file:text-sm file:font-medium dark:text-zinc-400 file:dark:bg-zinc-700"
             />
           )}
-          {isTauri() && (
+          {isInTauri && (
             <>
               <p className="text-sm text-zinc-600 dark:text-zinc-400">
                 V desktopové aplikaci vyberte soubory pouze tímto tlačítkem.
@@ -655,6 +672,12 @@ export function GrommetForm() {
       {error && (
         <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-800 dark:bg-red-900/30 dark:text-red-200">
           {error}
+        </div>
+      )}
+
+      {successMsg && (
+        <div className="rounded-lg border border-green-200 bg-green-50 p-3 text-sm text-green-800 dark:border-green-800 dark:bg-green-900/30 dark:text-green-200">
+          ✓ {successMsg}
         </div>
       )}
 
@@ -986,7 +1009,7 @@ export function GrommetForm() {
       />
 
       {/* Výstupní složka a přepis – pouze v desktopové aplikaci (Tauri) */}
-      {isTauri() && (
+      {isInTauri && (
         <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
           <h2 className="mb-2 text-lg font-semibold text-zinc-800 dark:text-zinc-100">
             Výstupní složka

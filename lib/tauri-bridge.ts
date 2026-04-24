@@ -19,8 +19,12 @@ export function isTauri(): boolean {
   return !!(window.__TAURI__ ?? window.__TAURI_INTERNALS__);
 }
 
-/** Výsledek otevření souborů v Tauri: soubory + adresář prvního souboru (pro výchozí uložení). */
-export type OpenFilesResult = { files: File[]; defaultSaveDir: string };
+/** Výsledek otevření souborů v Tauri: soubory + jejich plné cesty + adresář prvního souboru. */
+export type OpenFilesResult = {
+  files: File[];
+  paths: string[];
+  defaultSaveDir: string;
+};
 
 /** V Tauri otevře dialog pro výběr souborů; v prohlížeči vrátí null (použijte <input type="file">). */
 export async function openFilesViaTauri(options: {
@@ -39,13 +43,15 @@ export async function openFilesViaTauri(options: {
         : undefined,
     });
     if (pathOrPaths == null) return null;
-    const paths = Array.isArray(pathOrPaths) ? pathOrPaths : [pathOrPaths];
+    const selectedPaths = Array.isArray(pathOrPaths) ? pathOrPaths : [pathOrPaths];
     const files: File[] = [];
+    const filePaths: string[] = [];
     let defaultSaveDir = "";
-    for (let i = 0; i < paths.length; i++) {
-      const p = paths[i];
+    for (let i = 0; i < selectedPaths.length; i++) {
+      const p = selectedPaths[i];
       const pathStr = typeof p === "string" ? p : (p as { path?: string }).path ?? "";
       if (!pathStr) continue;
+      filePaths.push(pathStr);
       if (i === 0) {
         const lastSep = Math.max(pathStr.lastIndexOf("/"), pathStr.lastIndexOf("\\"));
         defaultSaveDir = lastSep >= 0 ? pathStr.slice(0, lastSep) : "";
@@ -60,7 +66,7 @@ export async function openFilesViaTauri(options: {
             : "application/octet-stream";
       files.push(new File([bytes], name, { type: mime }));
     }
-    return { files, defaultSaveDir };
+    return { files, paths: filePaths, defaultSaveDir };
   } catch {
     return null;
   }

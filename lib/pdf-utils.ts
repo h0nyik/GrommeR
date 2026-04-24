@@ -13,6 +13,20 @@ import { computeGrommetMarks } from "./grommet-marks";
 /** Převod mm na body (points) – PDF jednotky */
 const MM_TO_PT = 72 / 25.4;
 
+/** Maximální činitel měřítka 1:N (ochrana proti extrémním rozměrům / paměti). */
+const DRAWING_SCALE_MAX = 100;
+
+/**
+ * Normalizuje čitatel N v měřítku výkresu 1:N (1 jednotka na výkrese = N ve skutečnosti).
+ * Výstupní stránka se zvětší N×; rozteč, offset a velikost značky jsou v mm skutečného tisku.
+ */
+export function normalizeDrawingScale(value: number | undefined): number {
+  if (value == null || !Number.isFinite(value)) return 1;
+  if (value < 1) return 1;
+  if (value > DRAWING_SCALE_MAX) return DRAWING_SCALE_MAX;
+  return value;
+}
+
 /**
  * Načte PDF dokument z pole bytů (ArrayBuffer / Uint8Array).
  */
@@ -119,9 +133,72 @@ export function drawMarksOnPage(
   }
 }
 
+export interface AddGrommetMarksToPdfOptions {
+  /**
+   * Měřítko výkresu 1:N: výstupní stránka je N× větší než první stránka souboru (grafika se zvětší).
+   * Rozteč, offset a velikost značky zadávejte v mm u skutečného (zvětšeného) formátu.
+   * Výchozí 1 (1:1) = chování jako dříve (úprava stránky na místě).
+   */
+  drawingScale?: number;
+}
+
+function normalizePageBoxesToTrim(page: PDFPage): void {
+  const trim = page.getTrimBox();
+  const x = trim.x;
+  const y = trim.y;
+  const w = trim.width;
+  const h = trim.height;
+  page.setMediaBox(x, y, w, h);
+  page.setCropBox(x, y, w, h);
+  page.setBleedBox(x, y, w, h);
+  page.setTrimBox(x, y, w, h);
+  page.setArtBox(x, y, w, h);
+}
+
+/**
+ * Nový dokument: první stránka zdroje vykreslená N× větší, poté značky ve stejném souřadnicovém systému.
+ */
+async function addGrommetMarksToScaledPdf(
+  pdfBytes: ArrayBuffer | Uint8Array,
+  grommetParams: GrommetMarksParams,
+  drawOptions: DrawMarkOptions,
+  scale: number
+): Promise<Uint8Array> {
+  const srcDoc = await loadPdfDocument(pdfBytes);
+  const srcPages = srcDoc.getPages();
+  if (srcPages.length === 0) throw new Error("PDF neobsahuje žádnou stránku.");
+
+  const srcPage = srcPages[0];
+  const outDoc = await PDFDocument.create();
+  const embedded = await outDoc.embedPage(srcPage);
+  const newW = embedded.width * scale;
+  const newH = embedded.height * scale;
+  const page = outDoc.addPage([newW, newH]);
+  page.drawPage(embedded, {
+    x: 0,
+    y: 0,
+    width: newW,
+    height: newH,
+  });
+
+  normalizePageBoxesToTrim(page);
+
+  const info = getPageInfo(page, 0);
+  const params: GrommetMarksParams = {
+    ...grommetParams,
+    widthMm: info.widthMm,
+    heightMm: info.heightMm,
+  };
+  const { positions } = computeGrommetMarks(params);
+  drawMarksOnPage(page, positions, drawOptions);
+  normalizePageBoxesToTrim(page);
+
+  return outDoc.save();
+}
+
 /**
  * Načte PDF, přidá značky na první stránku podle parametrů a vrátí nové PDF jako bytes.
- * Existující obsah a barevný prostor dokumentu se nemění.
+ * Při drawingScale větším než 1 vytvoří nový dokument se zvětšenou grafikou (1:N).
  * Výstup je vždy čistý TrimBox: všechny boxy se nastaví na rozměr TrimBoxu, takže
  * výsledné PDF reprezentuje pouze čistý tiskový rozměr s vloženými značkami průchodek.
  * Rozměry a origin pro výpočet/kreslení značek jsou vždy TrimBox (nikoliv ArtBox ani MediaBox).
@@ -129,8 +206,14 @@ export function drawMarksOnPage(
 export async function addGrommetMarksToPdf(
   pdfBytes: ArrayBuffer | Uint8Array,
   grommetParams: GrommetMarksParams,
-  drawOptions: DrawMarkOptions
+  drawOptions: DrawMarkOptions,
+  options?: AddGrommetMarksToPdfOptions
 ): Promise<Uint8Array> {
+  const scale = normalizeDrawingScale(options?.drawingScale);
+  if (scale > 1) {
+    return addGrommetMarksToScaledPdf(pdfBytes, grommetParams, drawOptions, scale);
+  }
+
   const doc = await loadPdfDocument(pdfBytes);
   const pages = doc.getPages();
   if (pages.length === 0) throw new Error("PDF neobsahuje žádnou stránku.");
@@ -147,16 +230,7 @@ export async function addGrommetMarksToPdf(
   drawMarksOnPage(page, positions, drawOptions);
 
   // Vždy export čistého TrimBoxu: stránka = pouze rozměr TrimBoxu, bez ořezových značek a bleedu
-  const trim = page.getTrimBox();
-  const x = trim.x;
-  const y = trim.y;
-  const w = trim.width;
-  const h = trim.height;
-  page.setMediaBox(x, y, w, h);
-  page.setCropBox(x, y, w, h);
-  page.setBleedBox(x, y, w, h);
-  page.setTrimBox(x, y, w, h);
-  page.setArtBox(x, y, w, h);
+  normalizePageBoxesToTrim(page);
 
   return doc.save();
 }

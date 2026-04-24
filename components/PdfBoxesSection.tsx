@@ -19,9 +19,11 @@ function formatBoxSize(box: { width: number; height: number }): string {
 
 interface PdfBoxesSectionProps {
   pageInfo: PdfPageInfo | null;
+  /** Čitatel N v měřítku 1:N – zobrazení skutečného rozměru výstupu (volitelné). */
+  drawingScale?: number;
 }
 
-export function PdfBoxesSection({ pageInfo }: PdfBoxesSectionProps) {
+export function PdfBoxesSection({ pageInfo, drawingScale = 1 }: PdfBoxesSectionProps) {
   if (!pageInfo) {
     return (
       <section className="rounded-lg border border-zinc-200 bg-zinc-50/50 p-4 dark:border-zinc-700 dark:bg-zinc-900/50">
@@ -49,8 +51,21 @@ export function PdfBoxesSection({ pageInfo }: PdfBoxesSectionProps) {
         PDF boxy
       </h3>
       <p className="mb-3 text-sm text-zinc-500 dark:text-zinc-400">
-        Rozměry (TrimBox): <strong>{pageInfo.widthMm.toFixed(1)} × {pageInfo.heightMm.toFixed(1)} mm</strong>.
-        Výstupní PDF je vždy čistý TrimBox – pouze tento rozměr bez ořezových značek, s vloženými značkami.
+        Rozměry v souboru (TrimBox):{" "}
+        <strong>
+          {pageInfo.widthMm.toFixed(1)} × {pageInfo.heightMm.toFixed(1)} mm
+        </strong>
+        {drawingScale > 1 && (
+          <>
+            {" "}
+            → ve skutečném měřítku 1:{drawingScale}:{" "}
+            <strong>
+              {(pageInfo.widthMm * drawingScale).toFixed(1)} ×{" "}
+              {(pageInfo.heightMm * drawingScale).toFixed(1)} mm
+            </strong>
+          </>
+        )}
+        . Výstupní PDF je vždy čistý TrimBox – pouze tento rozměr bez ořezových značek, s vloženými značkami.
         Níže rozměry boxů zdrojového souboru pro informaci.
       </p>
       <ul className="space-y-2">

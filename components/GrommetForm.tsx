@@ -12,6 +12,7 @@ import {
   addGrommetMarksToPdf,
   getPageInfo,
   loadPdfDocument,
+  normalizeDrawingScale,
 } from "@/lib/pdf-utils";
 import type {
   Edge,
@@ -41,16 +42,31 @@ const EDGES: { value: Edge; label: string }[] = [
 
 const MAX_BATCH_FILES = 10;
 
+const DRAWING_SCALE_PRESETS = [1, 2, 5, 10] as const;
+
 type BatchStatus = "loading" | "ready" | "processing" | "done" | "error";
 
 interface BatchItem {
   id: string;
   file: File;
+  sourceDir: string | null;
   bytes: ArrayBuffer | null;
   pageInfo: PdfPageInfo | null;
   status: BatchStatus;
   error: string | null;
   outputNameOverride: string;
+}
+
+interface SelectedInputFile {
+  file: File;
+  sourceDir: string | null;
+}
+
+function getDirnameFromPath(path: string | null | undefined): string | null {
+  if (!path) return null;
+  const idx = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  if (idx < 0) return null;
+  return path.slice(0, idx);
 }
 
 function clamp(min: number, max: number, value: number): number {
@@ -190,6 +206,7 @@ function downloadBlobInBrowser(blob: Blob, filename: string): void {
 
 export function GrommetForm() {
   const [file, setFile] = useState<File | null>(null);
+  const [sourceDir, setSourceDir] = useState<string | null>(null);
   const [fileBytes, setFileBytes] = useState<ArrayBuffer | null>(null);
   const [pageInfo, setPageInfo] = useState<PdfPageInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -203,6 +220,8 @@ export function GrommetForm() {
   const [mode, setMode] = useState<"count" | "spacing">("spacing");
   const [countPerEdge, setCountPerEdge] = useState(5);
   const [spacing, setSpacing] = useState(48);
+  /** Čitatel N v měřítku výkresu 1:N (výstup zvětšen N× oproti souboru). */
+  const [drawingScaleN, setDrawingScaleN] = useState(1);
   const [shape, setShape] = useState<"circle" | "square">("circle");
   const [size, setSize] = useState(7);
   const [colorSpace, setColorSpace] = useState<"rgb" | "cmyk">("cmyk");
@@ -213,8 +232,10 @@ export function GrommetForm() {
   const [cmykK, setCmykK] = useState(0);
   const [defaultSaveDir, setDefaultSaveDir] = useState<string | null>(null);
   const [outputFolder, setOutputFolder] = useState<string | null>(null);
+  const [saveToSourceFolder, setSaveToSourceFolder] = useState(true);
   const [overwriteStrategy, setOverwriteStrategy] = useState<OverwriteStrategy>("overwrite");
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
   // Tauri detekce přes useEffect – řeší race condition při prvním renderu
   const [isInTauri, setIsInTauri] = useState(false);
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -265,11 +286,13 @@ export function GrommetForm() {
   );
 
   const applySelectedFiles = useCallback(
-    async (files: File[]) => {
+    async (selectedFiles: SelectedInputFile[]) => {
+      const files = selectedFiles.map((x) => x.file);
       setError(null);
       setPageInfo(null);
       setFileBytes(null);
       setFile(null);
+      setSourceDir(null);
       setBatchItems([]);
 
       if (files.length === 0) return;
@@ -287,8 +310,14 @@ export function GrommetForm() {
       }
 
       if (files.length === 1) {
-        const f = files[0];
+        const entry = selectedFiles[0];
+        const f = entry.file;
         setFile(f);
+        setSourceDir(entry.sourceDir);
+        if (saveToSourceFolder && entry.sourceDir) {
+          setOutputFolder(entry.sourceDir);
+          setDefaultSaveDir(entry.sourceDir);
+        }
         try {
           const bytes = await f.arrayBuffer();
           setFileBytes(bytes);
@@ -313,6 +342,7 @@ export function GrommetForm() {
       const items: BatchItem[] = files.map((file, i) => ({
         id: `${file.name}-${i}-${Date.now()}`,
         file,
+        sourceDir: selectedFiles[i]?.sourceDir ?? null,
         bytes: null,
         pageInfo: null,
         status: "loading" as BatchStatus,
@@ -323,12 +353,14 @@ export function GrommetForm() {
       const loaded = await Promise.all(items.map(loadOneBatchItem));
       setBatchItems(loaded);
     },
-    [loadOneBatchItem]
+    [loadOneBatchItem, saveToSourceFolder]
   );
 
   const onFileChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      applySelectedFiles(Array.from(e.target.files ?? []));
+      applySelectedFiles(
+        Array.from(e.target.files ?? []).map((file) => ({ file, sourceDir: null }))
+      );
     },
     [applySelectedFiles]
   );
@@ -341,12 +373,42 @@ export function GrommetForm() {
     if (result?.files.length) {
       if (result.defaultSaveDir) {
         setDefaultSaveDir(result.defaultSaveDir);
-        // Předvyplnit výstupní složku adresářem zdrojových souborů (lze přepsat)
-        setOutputFolder((prev) => prev ?? result.defaultSaveDir);
+        if (saveToSourceFolder) {
+          setOutputFolder(result.defaultSaveDir);
+        } else {
+          setOutputFolder((prev) => prev ?? result.defaultSaveDir);
+        }
       }
-      applySelectedFiles(result.files);
+      applySelectedFiles(
+        result.files.map((file, idx) => ({
+          file,
+          sourceDir: getDirnameFromPath(result.paths[idx] ?? null),
+        }))
+      );
     }
-  }, [applySelectedFiles]);
+  }, [applySelectedFiles, saveToSourceFolder]);
+
+  const handleDropOnTauri = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (!isInTauri || processing) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDragOver(false);
+      const dropped = Array.from(e.dataTransfer.files ?? []);
+      if (!dropped.length) return;
+      const selected: SelectedInputFile[] = dropped.map((file) => {
+        const maybePath = (file as File & { path?: string }).path;
+        return { file, sourceDir: getDirnameFromPath(maybePath ?? null) };
+      });
+      const firstDir = selected[0]?.sourceDir ?? null;
+      if (firstDir) {
+        setDefaultSaveDir(firstDir);
+        if (saveToSourceFolder) setOutputFolder(firstDir);
+      }
+      applySelectedFiles(selected);
+    },
+    [applySelectedFiles, isInTauri, processing, saveToSourceFolder]
+  );
 
   const handleChooseOutputFolder = useCallback(async () => {
     const folder = await chooseOutputFolderViaTauri();
@@ -360,6 +422,7 @@ export function GrommetForm() {
   };
 
   const offsetToMm = UNITS.find((u) => u.value === unit)!.toMm;
+  const drawingScale = normalizeDrawingScale(drawingScaleN);
 
   const handleBatchSubmit = async () => {
     const ready = batchItems.filter((i) => i.status === "ready" && i.bytes && i.pageInfo);
@@ -379,7 +442,8 @@ export function GrommetForm() {
       spacingVertCm = undefined;
       spacingCm = 0;
       if (ready[0].pageInfo && count > 1) {
-        const horzMm = (ready[0].pageInfo.widthMm - 2 * offsetXMm) / (count - 1);
+        const wEff = ready[0].pageInfo.widthMm * drawingScale;
+        const horzMm = (wEff - 2 * offsetXMm) / (count - 1);
         spacingCm = horzMm / 10;
       }
     }
@@ -411,14 +475,15 @@ export function GrommetForm() {
         const result = await addGrommetMarksToPdf(
           pdfBytes,
           params,
-          { shape, sizeMm: size, borderColor: getMarkColor() }
+          { shape, sizeMm: size, borderColor: getMarkColor() },
+          { drawingScale }
         );
         const outputName =
           item.outputNameOverride.trim() ||
           generateOutputFilename({
             originalFileName: item.file.name,
-            widthMm: item.pageInfo.widthMm,
-            heightMm: item.pageInfo.heightMm,
+            widthMm: item.pageInfo.widthMm * drawingScale,
+            heightMm: item.pageInfo.heightMm * drawingScale,
             spacingCm,
             spacingVertCm,
           });
@@ -426,7 +491,8 @@ export function GrommetForm() {
         new Uint8Array(ab).set(result);
         const blob = new Blob([ab], { type: "application/pdf" });
         if (isInTauri) {
-          const folder = outputFolder ?? defaultSaveDir;
+          const folder =
+            (saveToSourceFolder ? item.sourceDir : null) ?? outputFolder ?? defaultSaveDir;
           if (folder) {
             const savedPath = await saveBlobToFolder(blob, folder, outputName, overwriteStrategy);
             if (savedPath === null && overwriteStrategy !== "skip") {
@@ -501,26 +567,29 @@ export function GrommetForm() {
           shape,
           sizeMm: size,
           borderColor: getMarkColor(),
-        }
+        },
+        { drawingScale }
       );
       const offsetXMm = offsetToMm(offsetX);
       const offsetYMm = offsetToMm(offsetY);
+      const wEff = pageInfo.widthMm * drawingScale;
+      const hEff = pageInfo.heightMm * drawingScale;
       let spacingCm: number;
       let spacingVertCm: number | undefined;
       if (mode === "spacing") {
         spacingCm = spacing;
       } else {
         const count = Math.max(1, countPerEdge);
-        const horzMm = count > 1 ? (pageInfo.widthMm - 2 * offsetXMm) / (count - 1) : 0;
-        const vertMm = count > 1 ? (pageInfo.heightMm - 2 * offsetYMm) / (count - 1) : 0;
+        const horzMm = count > 1 ? (wEff - 2 * offsetXMm) / (count - 1) : 0;
+        const vertMm = count > 1 ? (hEff - 2 * offsetYMm) / (count - 1) : 0;
         spacingCm = horzMm / 10;
         spacingVertCm = Math.abs(vertMm / 10 - spacingCm) < 0.5 ? undefined : vertMm / 10;
       }
 
       const outputName = generateOutputFilename({
         originalFileName: file?.name ?? "vystup.pdf",
-        widthMm: pageInfo.widthMm,
-        heightMm: pageInfo.heightMm,
+        widthMm: wEff,
+        heightMm: hEff,
         spacingCm,
         spacingVertCm,
       });
@@ -534,7 +603,7 @@ export function GrommetForm() {
       const blob = new Blob([ab], { type: "application/pdf" });
 
       if (isInTauri) {
-        const folder = outputFolder ?? defaultSaveDir;
+        const folder = (saveToSourceFolder ? sourceDir : null) ?? outputFolder ?? defaultSaveDir;
         if (folder) {
           const savedPath = await saveBlobToFolder(blob, folder, outputName, overwriteStrategy);
           if (savedPath === null && overwriteStrategy !== "skip") {
@@ -572,7 +641,39 @@ export function GrommetForm() {
         <p className="mb-2 text-sm text-zinc-500 dark:text-zinc-400">
           Jeden soubor nebo dávka (až {MAX_BATCH_FILES}× PDF / JPG / PNG).
         </p>
-        <div className="flex flex-wrap items-center gap-2">
+        <div
+          onDragOver={(e) => {
+            if (!isInTauri || processing) return;
+            e.preventDefault();
+            setIsDragOver(true);
+          }}
+          onDragEnter={(e) => {
+            if (!isInTauri || processing) return;
+            e.preventDefault();
+            setIsDragOver(true);
+          }}
+          onDragLeave={(e) => {
+            if (!isInTauri || processing) return;
+            e.preventDefault();
+            setIsDragOver(false);
+          }}
+          onDrop={handleDropOnTauri}
+          className={
+            isInTauri
+              ? `rounded border-2 border-dashed p-3 transition ${
+                  isDragOver
+                    ? "border-blue-500 bg-blue-50/70 dark:border-blue-400 dark:bg-blue-900/20"
+                    : "border-zinc-300 dark:border-zinc-600"
+                }`
+              : ""
+          }
+        >
+          {isInTauri && (
+            <p className="mb-2 text-sm text-zinc-600 dark:text-zinc-400">
+              Drag&drop z Průzkumníka je podporován: přetáhněte PDF/JPG/PNG sem.
+            </p>
+          )}
+          <div className="flex flex-wrap items-center gap-2">
           {!isInTauri && (
             <input
               type="file"
@@ -585,7 +686,7 @@ export function GrommetForm() {
           {isInTauri && (
             <>
               <p className="text-sm text-zinc-600 dark:text-zinc-400">
-                V desktopové aplikaci vyberte soubory pouze tímto tlačítkem.
+                V desktopové aplikaci můžete použít tlačítko nebo drag&drop.
               </p>
               <button
                 type="button"
@@ -596,13 +697,23 @@ export function GrommetForm() {
               </button>
             </>
           )}
+          </div>
         </div>
         {file && !batchItems.length && (
           <>
             <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
               Soubor: {file.name}
               {pageInfo && (
-                <> — {pageInfo.widthMm.toFixed(1)} × {pageInfo.heightMm.toFixed(1)} mm
+                <>
+                  {" "}
+                  — {pageInfo.widthMm.toFixed(1)} × {pageInfo.heightMm.toFixed(1)} mm v souboru
+                  {drawingScale > 1 && (
+                    <>
+                      {" "}
+                      → {(pageInfo.widthMm * drawingScale).toFixed(1)} ×{" "}
+                      {(pageInfo.heightMm * drawingScale).toFixed(1)} mm při 1:{drawingScale}
+                    </>
+                  )}
                   {file.type.startsWith("image/") && " (obrázek → výstup PDF)"}
                 </>
               )}
@@ -680,6 +791,52 @@ export function GrommetForm() {
           ✓ {successMsg}
         </div>
       )}
+
+      {/* Měřítko výkresu */}
+      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+        <h2 className="mb-2 text-lg font-semibold text-zinc-800 dark:text-zinc-100">
+          Měřítko výkresu (1:N)
+        </h2>
+        <p className="mb-3 text-sm text-zinc-500 dark:text-zinc-400">
+          Pokud zákazník posílá data v měřítku (např. 1:10), zvolte stejné <strong>N</strong>. Aplikace
+          zvětší grafiku na výstupním PDF N× a značky vypočítá v milimetrech{" "}
+          <strong>skutečného</strong> formátu (rozteč, offset od okrajů, velikost značky).
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm text-zinc-600 dark:text-zinc-400">Předvolby:</span>
+          {DRAWING_SCALE_PRESETS.map((n) => (
+            <button
+              key={n}
+              type="button"
+              onClick={() => setDrawingScaleN(n)}
+              className={
+                drawingScaleN === n
+                  ? "rounded border border-zinc-800 bg-zinc-800 px-3 py-1.5 text-sm font-medium text-white dark:border-zinc-200 dark:bg-zinc-200 dark:text-zinc-900"
+                  : "rounded border border-zinc-300 bg-zinc-50 px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700"
+              }
+            >
+              1:{n}
+            </button>
+          ))}
+        </div>
+        <label className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="text-sm text-zinc-600 dark:text-zinc-400">Vlastní N (1 až 100):</span>
+          <input
+            type="number"
+            min={1}
+            max={100}
+            step="any"
+            value={drawingScaleN}
+            onChange={(e) => setDrawingScaleN(Number(e.target.value) || 1)}
+            className="w-24 rounded border border-zinc-300 px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+          />
+        </label>
+        {drawingScale !== drawingScaleN && (
+          <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+            Hodnota N byla omezena na rozsah 1–100 (použito 1:{drawingScale}).
+          </p>
+        )}
+      </section>
 
       {/* Hrany */}
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
@@ -1006,6 +1163,7 @@ export function GrommetForm() {
             ? batchItems.find((i) => i.pageInfo)?.pageInfo ?? null
             : pageInfo
         }
+        drawingScale={drawingScale}
       />
 
       {/* Výstupní složka a přepis – pouze v desktopové aplikaci (Tauri) */}
@@ -1014,10 +1172,19 @@ export function GrommetForm() {
           <h2 className="mb-2 text-lg font-semibold text-zinc-800 dark:text-zinc-100">
             Výstupní složka
           </h2>
+          <label className="mb-3 flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+            <input
+              type="checkbox"
+              checked={saveToSourceFolder}
+              onChange={(e) => setSaveToSourceFolder(e.target.checked)}
+            />
+            Ukládat automaticky do stejné složky jako zdrojový soubor
+          </label>
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={handleChooseOutputFolder}
+              disabled={saveToSourceFolder}
               className="rounded border border-zinc-300 bg-zinc-100 px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-200 dark:border-zinc-600 dark:bg-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-600"
             >
               Vybrat složku…
@@ -1030,6 +1197,7 @@ export function GrommetForm() {
                 <button
                   type="button"
                   onClick={() => setOutputFolder(null)}
+                  disabled={saveToSourceFolder}
                   className="text-xs text-red-500 hover:underline dark:text-red-400"
                 >
                   Zrušit
@@ -1037,7 +1205,9 @@ export function GrommetForm() {
               </>
             ) : (
               <span className="text-sm text-zinc-400 dark:text-zinc-500">
-                {defaultSaveDir ? `Výchozí: ${defaultSaveDir}` : "Nebyla vybrána – každý soubor vyžádá dialog"}
+                {defaultSaveDir
+                  ? `Výchozí: ${defaultSaveDir}`
+                  : "Nebyla zjištěna složka zdroje – uložení vyžádá dialog"}
               </span>
             )}
           </div>

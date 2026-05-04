@@ -264,7 +264,6 @@ export function GrommetForm() {
   const loadOneBatchItem = useCallback(
     async (item: BatchItem): Promise<BatchItem> => {
       const isPdf = item.file.type === "application/pdf";
-      const isImage = isSupportedImageType(item.file.type);
       try {
         const bytes = await item.file.arrayBuffer();
         let info: PdfPageInfo | null = null;

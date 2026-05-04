@@ -74,8 +74,8 @@ npm run tauri build
 
 Výstupní soubory:
 - `src-tauri/target/release/app.exe` – spustitelná aplikace bez instalace
-- `src-tauri/target/release/bundle/nsis/GrommetMarks_0.2.0_x64-setup.exe` – NSIS instalátor
-- `src-tauri/target/release/bundle/msi/GrommetMarks_0.2.0_x64_en-US.msi` – MSI instalátor
+- `src-tauri/target/release/bundle/nsis/GrommetMarks_0.2.1_x64-setup.exe` – NSIS instalátor
+- `src-tauri/target/release/bundle/msi/GrommetMarks_0.2.1_x64_en-US.msi` – MSI instalátor
 
 ---
 

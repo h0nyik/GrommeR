@@ -14,12 +14,20 @@ export function ImagePreview({ file, maxSize = MAX_PREVIEW_PX }: ImagePreviewPro
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const fileKey =
+    file && file.type.startsWith("image/")
+      ? `${file.name}:${file.size}:${file.lastModified}:${maxSize}`
+      : "";
+  const [prevFileKey, setPrevFileKey] = useState(fileKey);
+  if (fileKey !== prevFileKey) {
+    setPrevFileKey(fileKey);
+    setError(null);
+  }
+
   useEffect(() => {
     if (!file || !file.type.startsWith("image/")) {
-      setError(null);
       return;
     }
-    setError(null);
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {

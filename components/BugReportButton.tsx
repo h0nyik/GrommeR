@@ -12,19 +12,6 @@ function getEnvInfo(): string {
   return `Prohlížeč: ${ua}\nJazyk: ${lang}\nURL: ${url}\nRozlišení okna: ${w}×${h}\n`;
 }
 
-const BUG_TEMPLATE = `--- Popis chyby ---
-
-
---- Kroky k reprodukci ---
-1. 
-2. 
-3. 
-
---- Prostředí (vyplněno automaticky) ---
-${getEnvInfo()}
-Datum: ${new Date().toISOString()}
-`;
-
 export function BugReportButton() {
   const [open, setOpen] = useState(false);
   const [description, setDescription] = useState("");

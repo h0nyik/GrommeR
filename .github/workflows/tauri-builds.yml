@@ -1,15 +1,15 @@
 name: Tauri Builds
 
 # Pozn.: GitHub Release se vytvoří až po pushi tagu v* (job release). Běžné pushy
-# na main nahrávají jen workflow artefakty do záložky Actions.
+# na main/master nahrávají jen workflow artefakty do záložky Actions.
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "master"]
     tags:
       - "v*"
   pull_request:
-    branches: ["main"]
+    branches: ["main", "master"]
   workflow_dispatch:
 
 # Pro softprops/action-gh-release (vytvoření release u tagu) potřebujeme zápis;
@@ -53,10 +53,8 @@ jobs:
             os: ubuntu-22.04
           - name: macOS Apple Silicon
             os: macos-14
-          # Stejné labely jako v GCodeZAA-GUI; vyžaduje, aby byl self-hosted
-          # runner k tomuto repu (nebo org) přiřazen.
-          - name: macOS Intel
-            os: [self-hosted, macos, x64]
+          # macOS Intel (self-hosted): přidej znovu řádek s os: [self-hosted, macos, x64],
+          # až bude k repu/org přiřazen runner — bez něj by job visel ve frontě.
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -125,7 +123,6 @@ jobs:
             | Windows | NSIS/MSI v `tauri-Windows x64` |
             | Linux | `tauri-Linux x64` |
             | macOS Apple Silicon | `tauri-macos Apple Silicon` |
-            | macOS Intel | `tauri-macos Intel` (self-hosted) |
 
             Repozitář: [h0nyik/GrommeR](https://github.com/h0nyik/GrommeR)
           files: artifacts/**

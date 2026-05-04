@@ -8,8 +8,10 @@ export function AnalyticsConsent() {
   const [showBanner, setShowBanner] = useState(false);
 
   useEffect(() => {
-    setConsent(getAnalyticsConsent());
-    setShowBanner(true);
+    queueMicrotask(() => {
+      setConsent(getAnalyticsConsent());
+      setShowBanner(true);
+    });
   }, []);
 
   useEffect(() => {

@@ -86,17 +86,36 @@ jobs:
       - name: Build Tauri app
         run: npm run tauri build
 
-      - name: Upload bundle artifacts
+      # Jen finální instalátory – bez target/release/app.exe a bez rozbitých
+      # souborů z .app (při sloučení artefaktů do release se jinak objeví
+      # samostatné Info.plist, icon.icns atd.).
+      - name: Upload artefaktů (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-${{ matrix.name }}
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+
+      - name: Upload artefaktů (Linux)
+        if: matrix.os == 'ubuntu-22.04'
         uses: actions/upload-artifact@v4
         with:
           name: tauri-${{ matrix.name }}
           path: |
             src-tauri/target/release/bundle/**
-            src-tauri/target/release/*.exe
-            src-tauri/target/release/*.app
-            src-tauri/target/release/*.deb
-            src-tauri/target/release/*.AppImage
           if-no-files-found: warn
+
+      - name: Upload artefaktů (macOS)
+        if: matrix.os == 'macos-14'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-${{ matrix.name }}
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
 
   release:
     name: GitHub Release
@@ -122,7 +141,7 @@ jobs:
             |-----------|--------|
             | Windows | NSIS/MSI v `tauri-Windows x64` |
             | Linux | `tauri-Linux x64` |
-            | macOS Apple Silicon | `tauri-macos Apple Silicon` |
+            | macOS Apple Silicon | DMG (`*.dmg`) v `tauri-macos Apple Silicon` – přetáhnout aplikaci do „Aplikace“ |
 
             Repozitář: [h0nyik/GrommeR](https://github.com/h0nyik/GrommeR)
           files: artifacts/**

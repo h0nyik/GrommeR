@@ -27,13 +27,19 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "nsis", "msi"],
+    "targets": ["app", "dmg", "nsis", "msi"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "dmg": {
+        "appPosition": { "x": 180, "y": 220 },
+        "applicationFolderPosition": { "x": 480, "y": 220 }
+      }
+    }
   }
 }

@@ -36,7 +36,7 @@ Desktopová a webová aplikace pro generování **značek průchodek (grommet ma
 ### Desktopová verze (Windows / macOS)
 - **Windows** 10 nebo novější (64-bit)
 - [Microsoft Edge WebView2](https://developer.microsoft.com/cs-cz/microsoft-edge/webview2/) – obvykle předinstalován od Windows 11; na Windows 10 ke stažení zdarma
-- Instalátor **NSIS** nebo **MSI** z [Releases](https://github.com/h0nyik/GrommeR/releases)
+- Instalátor **NSIS** nebo **MSI**, případně **`GrommeR_portable.exe`** (stejná aplikace bez instalace) z [Releases](https://github.com/h0nyik/GrommeR/releases)
 - **macOS** (Apple Silicon): z Releases stáhněte **`.dmg`**, po připojení obrazu přetáhněte aplikaci na ikonu složky **Aplikace** v okně instalátoru
 
 ### Pro sestavení ze zdrojových kódů

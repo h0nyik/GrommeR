@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.2.2"
+version = "0.2.3"
 description = "Grommet Marks App – generátor značek průchodek do tiskových PDF bannerů"
 authors = ["h0nyik"]
 license = "MIT"

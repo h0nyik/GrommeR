@@ -2,7 +2,7 @@
  * Unit testy pro práci s PDF (načtení, boxy, vložení značek).
  */
 
-import { PDFDocument, rgb } from "pdf-lib";
+import { PDFDocument, PDFName, PDFNumber, rgb } from "pdf-lib";
 import { describe, expect, it } from "vitest";
 import {
   addGrommetMarksToPdf,
@@ -168,5 +168,36 @@ describe("addGrommetMarksToPdf", () => {
 
     expect(outInfo.widthMm).toBeCloseTo(srcInfo.widthMm * 2, 4);
     expect(outInfo.heightMm).toBeCloseTo(srcInfo.heightMm * 2, 4);
+  });
+
+  it("podporuje velké cílové plátno přes PDF UserUnit", async () => {
+    const bytes = await createMinimalPdf();
+    const result = await addGrommetMarksToPdf(
+      bytes,
+      {
+        widthMm: 12_000,
+        heightMm: 2_000,
+        edges: ["top", "bottom"],
+        offsetXMm: 100,
+        offsetYMm: 100,
+        mode: "spacing",
+        spacingMm: 500,
+      },
+      {
+        shape: "circle",
+        sizeMm: 20,
+        borderColor: { type: "rgb", r: 0, g: 0, b: 0 },
+      },
+      { targetSizeMm: { widthMm: 12_000, heightMm: 2_000 } }
+    );
+
+    const doc = await loadPdfDocument(result);
+    const page = doc.getPages()[0];
+    const info = getPageInfo(page, 0);
+    const userUnit = page.node.lookup(PDFName.of("UserUnit")) as PDFNumber;
+
+    expect(info.widthMm).toBeCloseTo(12_000, 1);
+    expect(info.heightMm).toBeCloseTo(2_000, 1);
+    expect(userUnit.asNumber()).toBeGreaterThan(1);
   });
 });

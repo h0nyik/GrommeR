@@ -1,11 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createPageInfoFromDimensionsMm,
   createPdfFromImage,
   getImageDimensionsMm,
-  isSupportedImageType,
 } from "@/lib/image-to-pdf";
 import { generateOutputFilename } from "@/lib/output-filename";
 import {
@@ -24,6 +23,7 @@ import { track } from "@/lib/analytics";
 import {
   chooseOutputFolderViaTauri,
   isTauri,
+  openDroppedPathsViaTauri,
   openFilesViaTauri,
   saveBlobToFolder,
   saveBlobViaTauri,
@@ -43,8 +43,19 @@ const EDGES: { value: Edge; label: string }[] = [
 const MAX_BATCH_FILES = 10;
 
 const DRAWING_SCALE_PRESETS = [1, 2, 5, 10] as const;
+const EXPORT_SETTINGS_STORAGE_KEY = "grommet-export-settings-v1";
+const MAX_RECENT_OUTPUT_FOLDERS = 5;
 
-type BatchStatus = "loading" | "ready" | "processing" | "done" | "error";
+const OUTPUT_SIZE_UNITS = [
+  { value: "mm", label: "mm", toMm: (v: number) => v, fromMm: (v: number) => v },
+  { value: "cm", label: "cm", toMm: (v: number) => v * 10, fromMm: (v: number) => v / 10 },
+  { value: "m", label: "m", toMm: (v: number) => v * 1000, fromMm: (v: number) => v / 1000 },
+] as const;
+
+type OutputSizeMode = "scale" | "target";
+type OutputSizeUnit = (typeof OUTPUT_SIZE_UNITS)[number]["value"];
+
+type BatchStatus = "loading" | "ready" | "processing" | "done" | "skipped" | "error";
 
 interface BatchItem {
   id: string;
@@ -62,11 +73,25 @@ interface SelectedInputFile {
   sourceDir: string | null;
 }
 
+interface ExportSettings {
+  saveToSourceFolder?: boolean;
+  outputFolder?: string | null;
+  recentOutputFolders?: string[];
+}
+
 function getDirnameFromPath(path: string | null | undefined): string | null {
   if (!path) return null;
   const idx = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   if (idx < 0) return null;
   return path.slice(0, idx);
+}
+
+function getInputFileKind(file: File): "pdf" | "image/jpeg" | "image/png" | null {
+  const name = file.name.toLowerCase();
+  if (file.type === "application/pdf" || name.endsWith(".pdf")) return "pdf";
+  if (file.type === "image/png" || name.endsWith(".png")) return "image/png";
+  if (file.type === "image/jpeg" || name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
+  return null;
 }
 
 function clamp(min: number, max: number, value: number): number {
@@ -230,9 +255,15 @@ export function GrommetForm() {
   const [cmykM, setCmykM] = useState(100);
   const [cmykY, setCmykY] = useState(0);
   const [cmykK, setCmykK] = useState(0);
+  const [outputSizeMode, setOutputSizeMode] = useState<OutputSizeMode>("scale");
+  const [targetWidth, setTargetWidth] = useState(0);
+  const [targetHeight, setTargetHeight] = useState(0);
+  const [targetUnit, setTargetUnit] = useState<OutputSizeUnit>("m");
   const [defaultSaveDir, setDefaultSaveDir] = useState<string | null>(null);
   const [outputFolder, setOutputFolder] = useState<string | null>(null);
   const [saveToSourceFolder, setSaveToSourceFolder] = useState(true);
+  const [recentOutputFolders, setRecentOutputFolders] = useState<string[]>([]);
+  const [exportSettingsLoaded, setExportSettingsLoaded] = useState(false);
   const [overwriteStrategy, setOverwriteStrategy] = useState<OverwriteStrategy>("overwrite");
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
@@ -244,11 +275,57 @@ export function GrommetForm() {
     setIsInTauri(isTauri());
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem(EXPORT_SETTINGS_STORAGE_KEY);
+      if (!raw) {
+        setExportSettingsLoaded(true);
+        return;
+      }
+      const settings = JSON.parse(raw) as ExportSettings;
+      if (typeof settings.saveToSourceFolder === "boolean") {
+        setSaveToSourceFolder(settings.saveToSourceFolder);
+      }
+      if (typeof settings.outputFolder === "string" && settings.outputFolder) {
+        setOutputFolder(settings.outputFolder);
+      }
+      if (Array.isArray(settings.recentOutputFolders)) {
+        setRecentOutputFolders(
+          settings.recentOutputFolders.filter((x): x is string => typeof x === "string").slice(0, MAX_RECENT_OUTPUT_FOLDERS)
+        );
+      }
+    } catch {
+      // Ignorujeme poškozené lokální nastavení.
+    } finally {
+      setExportSettingsLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!exportSettingsLoaded) return;
+    const settings: ExportSettings = {
+      saveToSourceFolder,
+      outputFolder,
+      recentOutputFolders,
+    };
+    window.localStorage.setItem(EXPORT_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  }, [exportSettingsLoaded, outputFolder, recentOutputFolders, saveToSourceFolder]);
+
   const showSuccess = (msg: string) => {
     setSuccessMsg(msg);
     if (successTimerRef.current) clearTimeout(successTimerRef.current);
     successTimerRef.current = setTimeout(() => setSuccessMsg(null), 8000);
   };
+
+  const rememberOutputFolder = useCallback((folder: string | null | undefined) => {
+    if (!folder) return;
+    setRecentOutputFolders((prev) => [
+      folder,
+      ...prev.filter((item) => item !== folder),
+    ].slice(0, MAX_RECENT_OUTPUT_FOLDERS));
+  }, []);
 
   const getMarkColor = (): MarkColor =>
     colorSpace === "rgb"
@@ -263,18 +340,20 @@ export function GrommetForm() {
 
   const loadOneBatchItem = useCallback(
     async (item: BatchItem): Promise<BatchItem> => {
-      const isPdf = item.file.type === "application/pdf";
+      const fileKind = getInputFileKind(item.file);
       try {
         const bytes = await item.file.arrayBuffer();
         let info: PdfPageInfo | null = null;
-        if (isPdf) {
+        if (fileKind === "pdf") {
           const doc = await loadPdfDocument(bytes);
           const pages = doc.getPages();
           if (pages.length === 0) return { ...item, bytes, status: "error", error: "Žádná stránka." };
           info = getPageInfo(pages[0], 0);
-        } else {
-          const dim = await getImageDimensionsMm(bytes, item.file.type as "image/jpeg" | "image/png");
+        } else if (fileKind) {
+          const dim = await getImageDimensionsMm(bytes, fileKind);
           info = createPageInfoFromDimensionsMm(dim.widthMm, dim.heightMm);
+        } else {
+          return { ...item, bytes, status: "error", error: "Nepodporovaný typ souboru." };
         }
         return { ...item, bytes, pageInfo: info, status: "ready", error: null };
       } catch (err) {
@@ -300,9 +379,7 @@ export function GrommetForm() {
         return;
       }
 
-      const valid = files.every(
-        (f) => f.type === "application/pdf" || isSupportedImageType(f.type)
-      );
+      const valid = files.every((f) => getInputFileKind(f) !== null);
       if (!valid) {
         setError("Pouze PDF nebo obrázky (JPG, PNG).");
         return;
@@ -320,7 +397,8 @@ export function GrommetForm() {
         try {
           const bytes = await f.arrayBuffer();
           setFileBytes(bytes);
-          if (f.type === "application/pdf") {
+          const fileKind = getInputFileKind(f);
+          if (fileKind === "pdf") {
             const doc = await loadPdfDocument(bytes);
             const pages = doc.getPages();
             if (pages.length === 0) {
@@ -328,8 +406,8 @@ export function GrommetForm() {
               return;
             }
             setPageInfo(getPageInfo(pages[0], 0));
-          } else {
-            const dim = await getImageDimensionsMm(bytes, f.type as "image/jpeg" | "image/png");
+          } else if (fileKind) {
+            const dim = await getImageDimensionsMm(bytes, fileKind);
             setPageInfo(createPageInfoFromDimensionsMm(dim.widthMm, dim.heightMm));
           }
         } catch (err) {
@@ -355,21 +433,9 @@ export function GrommetForm() {
     [loadOneBatchItem, saveToSourceFolder]
   );
 
-  const onFileChange = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      applySelectedFiles(
-        Array.from(e.target.files ?? []).map((file) => ({ file, sourceDir: null }))
-      );
-    },
-    [applySelectedFiles]
-  );
-
-  const handleTauriOpenFiles = useCallback(async () => {
-    const result = await openFilesViaTauri({
-      multiple: true,
-      accept: "application/pdf,image/jpeg,image/png",
-    });
-    if (result?.files.length) {
+  const applyOpenFilesResult = useCallback(
+    (result: { files: File[]; paths: string[]; defaultSaveDir: string }) => {
+      if (!result.files.length) return;
       if (result.defaultSaveDir) {
         setDefaultSaveDir(result.defaultSaveDir);
         if (saveToSourceFolder) {
@@ -384,8 +450,26 @@ export function GrommetForm() {
           sourceDir: getDirnameFromPath(result.paths[idx] ?? null),
         }))
       );
-    }
-  }, [applySelectedFiles, saveToSourceFolder]);
+    },
+    [applySelectedFiles, saveToSourceFolder]
+  );
+
+  const onFileChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      applySelectedFiles(
+        Array.from(e.target.files ?? []).map((file) => ({ file, sourceDir: null }))
+      );
+    },
+    [applySelectedFiles]
+  );
+
+  const handleTauriOpenFiles = useCallback(async () => {
+    const result = await openFilesViaTauri({
+      multiple: true,
+      accept: "application/pdf,image/jpeg,image/png",
+    });
+    if (result?.files.length) applyOpenFilesResult(result);
+  }, [applyOpenFilesResult]);
 
   const handleDropOnTauri = useCallback(
     (e: React.DragEvent<HTMLDivElement>) => {
@@ -409,10 +493,53 @@ export function GrommetForm() {
     [applySelectedFiles, isInTauri, processing, saveToSourceFolder]
   );
 
+  useEffect(() => {
+    if (!isInTauri) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    import("@tauri-apps/api/webview")
+      .then(({ getCurrentWebview }) =>
+        getCurrentWebview().onDragDropEvent(async (event) => {
+          if (processing) return;
+          const payload = event.payload as
+            | { type: "enter" | "over"; paths?: string[] }
+            | { type: "drop"; paths: string[] }
+            | { type: "leave" };
+          if (payload.type === "enter" || payload.type === "over") {
+            setIsDragOver(true);
+            return;
+          }
+          if (payload.type === "leave") {
+            setIsDragOver(false);
+            return;
+          }
+          setIsDragOver(false);
+          const result = await openDroppedPathsViaTauri(payload.paths ?? []);
+          if (result?.files.length) applyOpenFilesResult(result);
+        })
+      )
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {
+        // HTML5 drop handler níže zůstává jako fallback.
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [applyOpenFilesResult, isInTauri, processing]);
+
   const handleChooseOutputFolder = useCallback(async () => {
     const folder = await chooseOutputFolderViaTauri();
-    if (folder) setOutputFolder(folder);
-  }, []);
+    if (folder) {
+      setOutputFolder(folder);
+      setDefaultSaveDir(folder);
+      setSaveToSourceFolder(false);
+      rememberOutputFolder(folder);
+    }
+  }, [rememberOutputFolder]);
 
   const toggleEdge = (edge: Edge) => {
     setEdges((prev) =>
@@ -422,30 +549,65 @@ export function GrommetForm() {
 
   const offsetToMm = UNITS.find((u) => u.value === unit)!.toMm;
   const drawingScale = normalizeDrawingScale(drawingScaleN);
+  const targetSizeUnit = OUTPUT_SIZE_UNITS.find((u) => u.value === targetUnit)!;
+  const targetSizeMm = useMemo(
+    () =>
+      outputSizeMode === "target" && targetWidth > 0 && targetHeight > 0
+        ? {
+            widthMm: targetSizeUnit.toMm(targetWidth),
+            heightMm: targetSizeUnit.toMm(targetHeight),
+          }
+        : null,
+    [outputSizeMode, targetHeight, targetSizeUnit, targetWidth]
+  );
+  const getOutputSizeMm = useCallback(
+    (info: PdfPageInfo): { widthMm: number; heightMm: number } =>
+      targetSizeMm ?? {
+        widthMm: info.widthMm * drawingScale,
+        heightMm: info.heightMm * drawingScale,
+      },
+    [drawingScale, targetSizeMm]
+  );
+  const getSpacingForFilename = useCallback(
+    (info: PdfPageInfo): { spacingCm: number; spacingVertCm?: number } => {
+      if (mode === "spacing") return { spacingCm: spacing };
+
+      const outputSize = getOutputSizeMm(info);
+      const count = Math.max(1, countPerEdge);
+      if (count <= 1) return { spacingCm: 0 };
+
+      const offsetXMm = offsetToMm(offsetX);
+      const offsetYMm = offsetToMm(offsetY);
+      const horzMm = (outputSize.widthMm - 2 * offsetXMm) / (count - 1);
+      const vertMm = (outputSize.heightMm - 2 * offsetYMm) / (count - 1);
+      const spacingCm = horzMm / 10;
+      const spacingVertCm = Math.abs(vertMm / 10 - spacingCm) < 0.5 ? undefined : vertMm / 10;
+      return { spacingCm, spacingVertCm };
+    },
+    [countPerEdge, getOutputSizeMm, mode, offsetToMm, offsetX, offsetY, spacing]
+  );
+  const fillTargetSizeFromCurrentPage = useCallback(() => {
+    const info = batchItems.find((i) => i.pageInfo)?.pageInfo ?? pageInfo;
+    if (!info) return;
+    const unitDef = OUTPUT_SIZE_UNITS.find((u) => u.value === targetUnit)!;
+    setTargetWidth(Number(unitDef.fromMm(info.widthMm * drawingScale).toFixed(3)));
+    setTargetHeight(Number(unitDef.fromMm(info.heightMm * drawingScale).toFixed(3)));
+  }, [batchItems, drawingScale, pageInfo, targetUnit]);
 
   const handleBatchSubmit = async () => {
     const ready = batchItems.filter((i) => i.status === "ready" && i.bytes && i.pageInfo);
     if (ready.length === 0) return;
+    if (outputSizeMode === "target" && !targetSizeMm) {
+      setError("Zadejte kladnou šířku i výšku cílového plátna.");
+      return;
+    }
     setProcessing(true);
     setError(null);
     setSuccessMsg(null);
     let batchSuccessCount = 0;
+    let batchSkippedCount = 0;
     const offsetXMm = offsetToMm(offsetX);
     const offsetYMm = offsetToMm(offsetY);
-    let spacingCm: number;
-    let spacingVertCm: number | undefined;
-    if (mode === "spacing") {
-      spacingCm = spacing;
-    } else {
-      const count = Math.max(1, countPerEdge);
-      spacingVertCm = undefined;
-      spacingCm = 0;
-      if (ready[0].pageInfo && count > 1) {
-        const wEff = ready[0].pageInfo.widthMm * drawingScale;
-        const horzMm = (wEff - 2 * offsetXMm) / (count - 1);
-        spacingCm = horzMm / 10;
-      }
-    }
 
     for (let idx = 0; idx < ready.length; idx++) {
       const item = ready[idx];
@@ -455,15 +617,17 @@ export function GrommetForm() {
       );
       try {
         let pdfBytes: ArrayBuffer | Uint8Array = item.bytes;
-        if (isSupportedImageType(item.file.type)) {
+        const fileKind = getInputFileKind(item.file);
+        if (fileKind && fileKind !== "pdf") {
           pdfBytes = await createPdfFromImage(
             item.bytes,
-            item.file.type as "image/jpeg" | "image/png"
+            fileKind
           );
         }
+        const outputSize = getOutputSizeMm(item.pageInfo);
         const params: GrommetMarksParams = {
-          widthMm: item.pageInfo.widthMm,
-          heightMm: item.pageInfo.heightMm,
+          widthMm: outputSize.widthMm,
+          heightMm: outputSize.heightMm,
           edges,
           offsetXMm,
           offsetYMm,
@@ -475,27 +639,32 @@ export function GrommetForm() {
           pdfBytes,
           params,
           { shape, sizeMm: size, borderColor: getMarkColor() },
-          { drawingScale }
+          { drawingScale, targetSizeMm: targetSizeMm ?? undefined }
         );
         const outputName =
           item.outputNameOverride.trim() ||
           generateOutputFilename({
             originalFileName: item.file.name,
-            widthMm: item.pageInfo.widthMm * drawingScale,
-            heightMm: item.pageInfo.heightMm * drawingScale,
-            spacingCm,
-            spacingVertCm,
+            widthMm: outputSize.widthMm,
+            heightMm: outputSize.heightMm,
+            ...getSpacingForFilename(item.pageInfo),
           });
         const ab = new ArrayBuffer(result.byteLength);
         new Uint8Array(ab).set(result);
         const blob = new Blob([ab], { type: "application/pdf" });
+        let skipped = false;
         if (isInTauri) {
           const folder =
             (saveToSourceFolder ? item.sourceDir : null) ?? outputFolder ?? defaultSaveDir;
           if (folder) {
+            rememberOutputFolder(folder);
             const savedPath = await saveBlobToFolder(blob, folder, outputName, overwriteStrategy);
-            if (savedPath === null && overwriteStrategy !== "skip") {
-              throw new Error(`Nepodařilo se uložit soubor do složky: ${folder}`);
+            if (savedPath === null) {
+              if (overwriteStrategy === "skip") {
+                skipped = true;
+              } else {
+                throw new Error(`Nepodařilo se uložit soubor do složky: ${folder}`);
+              }
             }
           } else {
             // Žádná složka není vybrána – otevřeme dialog pro každý soubor
@@ -508,9 +677,14 @@ export function GrommetForm() {
           downloadBlobInBrowser(blob, outputName);
         }
         setBatchItems((prev) =>
-          prev.map((i) => (i.id === item.id ? { ...i, status: "done" as BatchStatus } : i))
+          prev.map((i) =>
+            i.id === item.id
+              ? { ...i, status: (skipped ? "skipped" : "done") as BatchStatus }
+              : i
+          )
         );
-        batchSuccessCount++;
+        if (skipped) batchSkippedCount++;
+        else batchSuccessCount++;
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Chyba";
         track({ type: "error", message: msg, context: "batch" });
@@ -523,8 +697,11 @@ export function GrommetForm() {
         );
       }
     }
-    track({ type: "batch_generated", count: ready.length });
-    showSuccess(`Dávka dokončena: ${batchSuccessCount} / ${ready.length} souborů úspěšně zpracováno.`);
+    if (batchSuccessCount > 0) track({ type: "batch_generated", count: batchSuccessCount });
+    showSuccess(
+      `Dávka dokončena: ${batchSuccessCount} / ${ready.length} souborů úspěšně zpracováno` +
+        (batchSkippedCount > 0 ? `, přeskočeno: ${batchSkippedCount}.` : ".")
+    );
     setProcessing(false);
   };
 
@@ -538,20 +715,26 @@ export function GrommetForm() {
       setError("Nejprve nahrajte PDF nebo obrázek.");
       return;
     }
+    if (outputSizeMode === "target" && !targetSizeMm) {
+      setError("Zadejte kladnou šířku i výšku cílového plátna.");
+      return;
+    }
     setError(null);
     setSuccessMsg(null);
     setProcessing(true);
     try {
       let pdfBytes: ArrayBuffer | Uint8Array = fileBytes;
-      if (isSupportedImageType(file.type)) {
+      const fileKind = getInputFileKind(file);
+      if (fileKind && fileKind !== "pdf") {
         pdfBytes = await createPdfFromImage(
           fileBytes,
-          file.type as "image/jpeg" | "image/png"
+          fileKind
         );
       }
+      const outputSize = getOutputSizeMm(pageInfo);
       const params: GrommetMarksParams = {
-        widthMm: pageInfo.widthMm,
-        heightMm: pageInfo.heightMm,
+        widthMm: outputSize.widthMm,
+        heightMm: outputSize.heightMm,
         edges,
         offsetXMm: offsetToMm(offsetX),
         offsetYMm: offsetToMm(offsetY),
@@ -567,30 +750,16 @@ export function GrommetForm() {
           sizeMm: size,
           borderColor: getMarkColor(),
         },
-        { drawingScale }
+        { drawingScale, targetSizeMm: targetSizeMm ?? undefined }
       );
-      const offsetXMm = offsetToMm(offsetX);
-      const offsetYMm = offsetToMm(offsetY);
-      const wEff = pageInfo.widthMm * drawingScale;
-      const hEff = pageInfo.heightMm * drawingScale;
-      let spacingCm: number;
-      let spacingVertCm: number | undefined;
-      if (mode === "spacing") {
-        spacingCm = spacing;
-      } else {
-        const count = Math.max(1, countPerEdge);
-        const horzMm = count > 1 ? (wEff - 2 * offsetXMm) / (count - 1) : 0;
-        const vertMm = count > 1 ? (hEff - 2 * offsetYMm) / (count - 1) : 0;
-        spacingCm = horzMm / 10;
-        spacingVertCm = Math.abs(vertMm / 10 - spacingCm) < 0.5 ? undefined : vertMm / 10;
-      }
+      const wEff = outputSize.widthMm;
+      const hEff = outputSize.heightMm;
 
       const outputName = generateOutputFilename({
         originalFileName: file?.name ?? "vystup.pdf",
         widthMm: wEff,
         heightMm: hEff,
-        spacingCm,
-        spacingVertCm,
+        ...getSpacingForFilename(pageInfo),
       });
 
       if (!result || result.byteLength < 50) {
@@ -604,11 +773,16 @@ export function GrommetForm() {
       if (isInTauri) {
         const folder = (saveToSourceFolder ? sourceDir : null) ?? outputFolder ?? defaultSaveDir;
         if (folder) {
+          rememberOutputFolder(folder);
           const savedPath = await saveBlobToFolder(blob, folder, outputName, overwriteStrategy);
-          if (savedPath === null && overwriteStrategy !== "skip") {
+          if (savedPath === null) {
+            if (overwriteStrategy === "skip") {
+              showSuccess(`Soubor přeskočen, protože už existuje: ${outputName}`);
+              return;
+            }
             throw new Error(`Nepodařilo se uložit soubor do složky: ${folder}`);
           }
-          showSuccess(`Soubor uložen: ${savedPath ?? outputName}`);
+          showSuccess(`Soubor uložen: ${savedPath}`);
         } else {
           const dialSaved = await saveBlobViaTauri(blob, outputName, null);
           if (!dialSaved) {
@@ -706,19 +880,24 @@ export function GrommetForm() {
                 <>
                   {" "}
                   — {pageInfo.widthMm.toFixed(1)} × {pageInfo.heightMm.toFixed(1)} mm v souboru
-                  {drawingScale > 1 && (
+                  {targetSizeMm ? (
+                    <>
+                      {" "}
+                      → {targetSizeMm.widthMm.toFixed(1)} × {targetSizeMm.heightMm.toFixed(1)} mm cílové plátno
+                    </>
+                  ) : drawingScale > 1 && (
                     <>
                       {" "}
                       → {(pageInfo.widthMm * drawingScale).toFixed(1)} ×{" "}
                       {(pageInfo.heightMm * drawingScale).toFixed(1)} mm při 1:{drawingScale}
                     </>
                   )}
-                  {file.type.startsWith("image/") && " (obrázek → výstup PDF)"}
+                  {getInputFileKind(file)?.startsWith("image/") && " (obrázek → výstup PDF)"}
                 </>
               )}
             </p>
-            <ImagePreview file={file.type.startsWith("image/") ? file : null} />
-            <PdfPreview file={file?.type === "application/pdf" ? file : null} />
+            <ImagePreview file={getInputFileKind(file)?.startsWith("image/") ? file : null} />
+            <PdfPreview file={getInputFileKind(file) === "pdf" ? file : null} />
           </>
         )}
         {batchItems.length > 0 && (
@@ -738,6 +917,7 @@ export function GrommetForm() {
                   {item.pageInfo && (
                     <span className="text-zinc-500">
                       {item.pageInfo.widthMm.toFixed(0)}×{item.pageInfo.heightMm.toFixed(0)} mm
+                      {targetSizeMm && ` → ${targetSizeMm.widthMm.toFixed(0)}×${targetSizeMm.heightMm.toFixed(0)} mm`}
                     </span>
                   )}
                   <span
@@ -746,6 +926,8 @@ export function GrommetForm() {
                         ? "text-red-600 dark:text-red-400"
                         : item.status === "done"
                           ? "text-green-600 dark:text-green-400"
+                          : item.status === "skipped"
+                            ? "text-amber-600 dark:text-amber-400"
                           : item.status === "processing"
                             ? "text-blue-600 dark:text-blue-400"
                             : "text-zinc-500"
@@ -755,6 +937,7 @@ export function GrommetForm() {
                     {item.status === "ready" && "připraveno"}
                     {item.status === "processing" && "zpracovávám…"}
                     {item.status === "done" && "hotovo"}
+                    {item.status === "skipped" && "přeskočeno"}
                     {item.status === "error" && (item.error ?? "chyba")}
                   </span>
                   {item.status === "ready" && (
@@ -835,6 +1018,81 @@ export function GrommetForm() {
             Hodnota N byla omezena na rozsah 1–100 (použito 1:{drawingScale}).
           </p>
         )}
+        <div className="mt-4 rounded border border-zinc-200 p-3 dark:border-zinc-700">
+          <div className="mb-2 flex flex-wrap gap-4">
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="radio"
+                name="outputSizeMode"
+                checked={outputSizeMode === "scale"}
+                onChange={() => setOutputSizeMode("scale")}
+              />
+              Použít měřítko 1:N
+            </label>
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="radio"
+                name="outputSizeMode"
+                checked={outputSizeMode === "target"}
+                onChange={() => {
+                  setOutputSizeMode("target");
+                  if (targetWidth <= 0 || targetHeight <= 0) fillTargetSizeFromCurrentPage();
+                }}
+              />
+              Zadat cílový rozměr plátna
+            </label>
+          </div>
+          {outputSizeMode === "target" && (
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="flex flex-col gap-1">
+                <span className="text-xs text-zinc-500 dark:text-zinc-400">Šířka</span>
+                <input
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={targetWidth}
+                  onChange={(e) => setTargetWidth(Number(e.target.value) || 0)}
+                  className="w-28 rounded border border-zinc-300 px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-xs text-zinc-500 dark:text-zinc-400">Výška</span>
+                <input
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={targetHeight}
+                  onChange={(e) => setTargetHeight(Number(e.target.value) || 0)}
+                  className="w-28 rounded border border-zinc-300 px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-xs text-zinc-500 dark:text-zinc-400">Jednotka</span>
+                <select
+                  value={targetUnit}
+                  onChange={(e) => setTargetUnit(e.target.value as OutputSizeUnit)}
+                  className="rounded border border-zinc-300 px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                >
+                  {OUTPUT_SIZE_UNITS.map((u) => (
+                    <option key={u.value} value={u.value}>
+                      {u.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                onClick={fillTargetSizeFromCurrentPage}
+                className="rounded border border-zinc-300 bg-zinc-100 px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-200 dark:border-zinc-600 dark:bg-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-600"
+              >
+                Vyplnit z PDF
+              </button>
+              <p className="basis-full text-xs text-zinc-500 dark:text-zinc-400">
+                Pro velké plachty, např. 12 m, aplikace vytvoří fyzicky velké PDF plátno a v případě potřeby použije PDF UserUnit.
+              </p>
+            </div>
+          )}
+        </div>
       </section>
 
       {/* Hrany */}
@@ -1163,6 +1421,7 @@ export function GrommetForm() {
             : pageInfo
         }
         drawingScale={drawingScale}
+        targetSizeMm={targetSizeMm}
       />
 
       {/* Výstupní složka a přepis – pouze v desktopové aplikaci (Tauri) */}
@@ -1179,14 +1438,16 @@ export function GrommetForm() {
             />
             Ukládat automaticky do stejné složky jako zdrojový soubor
           </label>
+          <p className="mb-3 text-xs text-zinc-500 dark:text-zinc-400">
+            Když tuto volbu vypnete, použije se výchozí exportní složka níže. Vybraná složka se uloží i pro další spuštění aplikace.
+          </p>
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={handleChooseOutputFolder}
-              disabled={saveToSourceFolder}
               className="rounded border border-zinc-300 bg-zinc-100 px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-200 dark:border-zinc-600 dark:bg-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-600"
             >
-              Vybrat složku…
+              Vybrat výchozí exportní složku…
             </button>
             {outputFolder ? (
               <>
@@ -1196,7 +1457,6 @@ export function GrommetForm() {
                 <button
                   type="button"
                   onClick={() => setOutputFolder(null)}
-                  disabled={saveToSourceFolder}
                   className="text-xs text-red-500 hover:underline dark:text-red-400"
                 >
                   Zrušit
@@ -1210,6 +1470,31 @@ export function GrommetForm() {
               </span>
             )}
           </div>
+          {recentOutputFolders.length > 0 && (
+            <div className="mt-3">
+              <span className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                Naposledy použité složky:
+              </span>
+              <div className="flex flex-wrap gap-2">
+                {recentOutputFolders.map((folder) => (
+                  <button
+                    key={folder}
+                    type="button"
+                    title={folder}
+                    onClick={() => {
+                      setOutputFolder(folder);
+                      setDefaultSaveDir(folder);
+                      setSaveToSourceFolder(false);
+                      rememberOutputFolder(folder);
+                    }}
+                    className="max-w-xs truncate rounded border border-zinc-300 bg-zinc-50 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700"
+                  >
+                    {folder}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="mt-3">
             <span className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">
               Při konfliktu názvů:

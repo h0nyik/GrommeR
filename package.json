@@ -1,6 +1,6 @@
 {
   "name": "grommet-marks-app",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -14,6 +14,7 @@
     "build:portable": "npm run tauri build && node scripts/build-portable.cjs"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-fs": "^2.4.5",
     "next": "16.1.6",

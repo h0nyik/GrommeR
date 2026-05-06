@@ -45,7 +45,7 @@ export function formatDimensionMm(valueMm: number): { value: number; unit: "m" |
   if (valueMm >= 1000) {
     return { value: Math.round((valueMm / 1000) * 10) / 10, unit: "m" };
   }
-  return { value: Math.round(valueMm * 10) / 10, unit: "cm" };
+  return { value: Math.round((valueMm / 10) * 10) / 10, unit: "cm" };
 }
 
 /**

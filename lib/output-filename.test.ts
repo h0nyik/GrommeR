@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  formatDimensionMm,
   formatDimensionsForFilename,
   formatSpacingForFilename,
   generateOutputFilename,
@@ -32,6 +33,16 @@ describe("sanitizeBaseName", () => {
 
   it("vrátí vystup pro prázdný výsledek", () => {
     expect(sanitizeBaseName("___final.pdf")).toBe("vystup");
+  });
+});
+
+describe("formatDimensionMm", () => {
+  it("převádí menší rozměry z mm na cm", () => {
+    expect(formatDimensionMm(500)).toEqual({ value: 50, unit: "cm" });
+  });
+
+  it("převádí velké rozměry na metry", () => {
+    expect(formatDimensionMm(13000)).toEqual({ value: 13, unit: "m" });
   });
 });
 

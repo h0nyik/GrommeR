@@ -12,17 +12,12 @@ interface ImagePreviewProps {
 
 export function ImagePreview({ file, maxSize = MAX_PREVIEW_PX }: ImagePreviewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ fileKey: string; message: string } | null>(null);
 
   const fileKey =
     file && file.type.startsWith("image/")
       ? `${file.name}:${file.size}:${file.lastModified}:${maxSize}`
       : "";
-  const [prevFileKey, setPrevFileKey] = useState(fileKey);
-  if (fileKey !== prevFileKey) {
-    setPrevFileKey(fileKey);
-    setError(null);
-  }
 
   useEffect(() => {
     if (!file || !file.type.startsWith("image/")) {
@@ -50,15 +45,17 @@ export function ImagePreview({ file, maxSize = MAX_PREVIEW_PX }: ImagePreviewPro
       URL.revokeObjectURL(url);
     };
     img.onerror = () => {
-      setError("Nepodařilo se načíst náhled.");
+      setError({ fileKey, message: "Nepodařilo se načíst náhled." });
       URL.revokeObjectURL(url);
     };
     img.src = url;
     return () => URL.revokeObjectURL(url);
-  }, [file, maxSize]);
+  }, [file, fileKey, maxSize]);
 
   if (!file || !file.type.startsWith("image/")) return null;
-  if (error) return <p className="text-sm text-amber-600">{error}</p>;
+  if (error?.fileKey === fileKey) {
+    return <p className="text-sm text-amber-600">{error.message}</p>;
+  }
 
   return (
     <div className="mt-2">

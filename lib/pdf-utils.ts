@@ -4,7 +4,7 @@
  * Barevný prostor existujícího obsahu PDF neměníme – přidáváme pouze nové vektorové značky (RGB).
  */
 
-import { PDFDocument, rgb, cmyk, type PDFPage } from "pdf-lib";
+import { PDFDocument, PDFName, PDFNumber, rgb, cmyk, type PDFPage } from "pdf-lib";
 import type { MarkPosition } from "@/types/grommet";
 import type { GrommetMarksParams, MarkColor } from "@/types/grommet";
 import type { PdfBox, PdfPageInfo } from "@/types/grommet";
@@ -12,6 +12,8 @@ import { computeGrommetMarks } from "./grommet-marks";
 
 /** Převod mm na body (points) – PDF jednotky */
 const MM_TO_PT = 72 / 25.4;
+const PT_TO_MM = 25.4 / 72;
+const PDF_MAX_COORDINATE_PT = 14_400;
 
 /** Maximální činitel měřítka 1:N (ochrana proti extrémním rozměrům / paměti). */
 const DRAWING_SCALE_MAX = 100;
@@ -27,6 +29,37 @@ export function normalizeDrawingScale(value: number | undefined): number {
   return value;
 }
 
+function getPdfPageUserUnit(page: PDFPage): number {
+  const node = page.node as { lookup?: (key: PDFName) => unknown };
+  const raw = node.lookup?.(PDFName.of("UserUnit"));
+  const value =
+    raw && typeof (raw as { asNumber?: () => number }).asNumber === "function"
+      ? (raw as { asNumber: () => number }).asNumber()
+      : 1;
+  return Number.isFinite(value) && value > 0 ? value : 1;
+}
+
+function setPdfPageUserUnit(page: PDFPage, userUnit: number): void {
+  if (userUnit <= 1) return;
+  page.node.set(PDFName.of("UserUnit"), PDFNumber.of(userUnit));
+}
+
+function choosePdfPageUserUnit(widthMm: number, heightMm: number): number {
+  const maxPt = Math.max(widthMm, heightMm) * MM_TO_PT;
+  if (maxPt <= PDF_MAX_COORDINATE_PT) return 1;
+  return Math.min(75_000, maxPt / PDF_MAX_COORDINATE_PT);
+}
+
+function addPhysicalSizePage(doc: PDFDocument, widthMm: number, heightMm: number): PDFPage {
+  const userUnit = choosePdfPageUserUnit(widthMm, heightMm);
+  const page = doc.addPage([
+    (widthMm * MM_TO_PT) / userUnit,
+    (heightMm * MM_TO_PT) / userUnit,
+  ]);
+  setPdfPageUserUnit(page, userUnit);
+  return page;
+}
+
 /**
  * Načte PDF dokument z pole bytů (ArrayBuffer / Uint8Array).
  */
@@ -39,6 +72,7 @@ export async function loadPdfDocument(bytes: ArrayBuffer | Uint8Array) {
  * widthMm/heightMm odpovídají TrimBoxu (výstupní rozměr tisku); fallback na CropBox → MediaBox.
  */
 export function getPageInfo(page: PDFPage, pageIndex: number): PdfPageInfo {
+  const userUnit = getPdfPageUserUnit(page);
   const mediaBox = page.getMediaBox();
   const cropBox = page.getCropBox();
   const bleedBox = page.getBleedBox();
@@ -55,11 +89,12 @@ export function getPageInfo(page: PDFPage, pageIndex: number): PdfPageInfo {
   // Výstupní PDF je vždy TrimBox – proto jeho rozměry používáme jako referenci pro výpočet značek.
   // V pdf-lib getTrimBox() nikdy nevrátí null (fallback: CropBox → MediaBox), takže je bezpečné.
   const refBox = trimBox;
-  const widthMm = (refBox.width * 25.4) / 72;
-  const heightMm = (refBox.height * 25.4) / 72;
+  const widthMm = refBox.width * userUnit * PT_TO_MM;
+  const heightMm = refBox.height * userUnit * PT_TO_MM;
 
   return {
     pageIndex,
+    userUnit,
     mediaBox: boxToPdfBox(mediaBox),
     cropBox: boxToPdfBox(cropBox),
     bleedBox: boxToPdfBox(bleedBox),
@@ -93,8 +128,10 @@ export function drawMarksOnPage(
   options: DrawMarkOptions
 ): void {
   const { shape, sizeMm, borderColor, borderWidthPt = 0.5 } = options;
-  const sizePt = sizeMm * MM_TO_PT;
+  const userUnit = getPdfPageUserUnit(page);
+  const sizePt = (sizeMm * MM_TO_PT) / userUnit;
   const halfPt = sizePt / 2;
+  const borderWidth = borderWidthPt / userUnit;
 
   // Používáme TrimBox jako origin, protože výstupní PDF je vždy ořezán na TrimBox.
   // Pozice značek (v mm od 0,0) se tak korektně promítnou do absolutního souřadnicového systému PDF.
@@ -108,8 +145,8 @@ export function drawMarksOnPage(
       : cmyk(borderColor.c, borderColor.m, borderColor.y, borderColor.k);
 
   for (const pos of positions) {
-    const xPt = originX + pos.x * MM_TO_PT;
-    const yPt = originY + pos.y * MM_TO_PT;
+    const xPt = originX + (pos.x * MM_TO_PT) / userUnit;
+    const yPt = originY + (pos.y * MM_TO_PT) / userUnit;
 
     if (shape === "circle") {
       page.drawCircle({
@@ -118,7 +155,7 @@ export function drawMarksOnPage(
         size: halfPt, // pdf-lib: size = poloměr; sizePt = průměr → poloměr = sizePt/2
         color,
         borderColor: color,
-        borderWidth: borderWidthPt,
+        borderWidth,
       });
     } else {
       page.drawSquare({
@@ -127,7 +164,7 @@ export function drawMarksOnPage(
         size: sizePt,
         color,
         borderColor: color,
-        borderWidth: borderWidthPt,
+        borderWidth,
       });
     }
   }
@@ -140,6 +177,11 @@ export interface AddGrommetMarksToPdfOptions {
    * Výchozí 1 (1:1) = chování jako dříve (úprava stránky na místě).
    */
   drawingScale?: number;
+  /** Volitelný cílový fyzický rozměr výstupní stránky v mm. */
+  targetSizeMm?: {
+    widthMm: number;
+    heightMm: number;
+  };
 }
 
 function normalizePageBoxesToTrim(page: PDFPage): void {
@@ -162,23 +204,26 @@ async function addGrommetMarksToScaledPdf(
   pdfBytes: ArrayBuffer | Uint8Array,
   grommetParams: GrommetMarksParams,
   drawOptions: DrawMarkOptions,
-  scale: number
+  scale: number,
+  targetSizeMm?: { widthMm: number; heightMm: number }
 ): Promise<Uint8Array> {
   const srcDoc = await loadPdfDocument(pdfBytes);
   const srcPages = srcDoc.getPages();
   if (srcPages.length === 0) throw new Error("PDF neobsahuje žádnou stránku.");
 
   const srcPage = srcPages[0];
+  const srcInfo = getPageInfo(srcPage, 0);
   const outDoc = await PDFDocument.create();
   const embedded = await outDoc.embedPage(srcPage);
-  const newW = embedded.width * scale;
-  const newH = embedded.height * scale;
-  const page = outDoc.addPage([newW, newH]);
+  const outputWidthMm = targetSizeMm?.widthMm ?? srcInfo.widthMm * scale;
+  const outputHeightMm = targetSizeMm?.heightMm ?? srcInfo.heightMm * scale;
+  const page = addPhysicalSizePage(outDoc, outputWidthMm, outputHeightMm);
+  const trimBox = page.getTrimBox();
   page.drawPage(embedded, {
-    x: 0,
-    y: 0,
-    width: newW,
-    height: newH,
+    x: trimBox.x,
+    y: trimBox.y,
+    width: trimBox.width,
+    height: trimBox.height,
   });
 
   normalizePageBoxesToTrim(page);
@@ -210,8 +255,9 @@ export async function addGrommetMarksToPdf(
   options?: AddGrommetMarksToPdfOptions
 ): Promise<Uint8Array> {
   const scale = normalizeDrawingScale(options?.drawingScale);
-  if (scale > 1) {
-    return addGrommetMarksToScaledPdf(pdfBytes, grommetParams, drawOptions, scale);
+  const targetSizeMm = options?.targetSizeMm;
+  if (scale > 1 || targetSizeMm) {
+    return addGrommetMarksToScaledPdf(pdfBytes, grommetParams, drawOptions, scale, targetSizeMm);
   }
 
   const doc = await loadPdfDocument(pdfBytes);

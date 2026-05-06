@@ -26,6 +26,36 @@ export type OpenFilesResult = {
   defaultSaveDir: string;
 };
 
+function getMimeTypeFromPath(pathStr: string): string {
+  const name = pathStr.toLowerCase();
+  if (name.endsWith(".pdf")) return "application/pdf";
+  if (name.endsWith(".png")) return "image/png";
+  if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
+  return "application/octet-stream";
+}
+
+function getDirnameFromPath(pathStr: string): string {
+  const lastSep = Math.max(pathStr.lastIndexOf("/"), pathStr.lastIndexOf("\\"));
+  return lastSep >= 0 ? pathStr.slice(0, lastSep) : "";
+}
+
+async function filesFromPaths(selectedPaths: string[]): Promise<OpenFilesResult> {
+  const { readFile } = await import("@tauri-apps/plugin-fs");
+  const files: File[] = [];
+  const filePaths: string[] = [];
+  let defaultSaveDir = "";
+  for (let i = 0; i < selectedPaths.length; i++) {
+    const pathStr = selectedPaths[i];
+    if (!pathStr) continue;
+    filePaths.push(pathStr);
+    if (i === 0) defaultSaveDir = getDirnameFromPath(pathStr);
+    const bytes = await readFile(pathStr);
+    const name = pathStr.replace(/^.*[\\/]/, "");
+    files.push(new File([bytes], name, { type: getMimeTypeFromPath(pathStr) }));
+  }
+  return { files, paths: filePaths, defaultSaveDir };
+}
+
 /** V Tauri otevře dialog pro výběr souborů; v prohlížeči vrátí null (použijte <input type="file">). */
 export async function openFilesViaTauri(options: {
   multiple: boolean;
@@ -34,7 +64,6 @@ export async function openFilesViaTauri(options: {
   if (!isTauri()) return null;
   try {
     const { open } = await import("@tauri-apps/plugin-dialog");
-    const { readFile } = await import("@tauri-apps/plugin-fs");
     const pathOrPaths = await open({
       multiple: options.multiple,
       directory: false,
@@ -44,29 +73,20 @@ export async function openFilesViaTauri(options: {
     });
     if (pathOrPaths == null) return null;
     const selectedPaths = Array.isArray(pathOrPaths) ? pathOrPaths : [pathOrPaths];
-    const files: File[] = [];
-    const filePaths: string[] = [];
-    let defaultSaveDir = "";
-    for (let i = 0; i < selectedPaths.length; i++) {
-      const p = selectedPaths[i];
-      const pathStr = typeof p === "string" ? p : (p as { path?: string }).path ?? "";
-      if (!pathStr) continue;
-      filePaths.push(pathStr);
-      if (i === 0) {
-        const lastSep = Math.max(pathStr.lastIndexOf("/"), pathStr.lastIndexOf("\\"));
-        defaultSaveDir = lastSep >= 0 ? pathStr.slice(0, lastSep) : "";
-      }
-      const bytes = await readFile(pathStr);
-      const name = pathStr.replace(/^.*[\\/]/, "");
-      const mime =
-        name.toLowerCase().endsWith(".pdf")
-          ? "application/pdf"
-          : name.toLowerCase().match(/\.(jpe?g|png)$/)
-            ? `image/${name.toLowerCase().endsWith(".png") ? "png" : "jpeg"}`
-            : "application/octet-stream";
-      files.push(new File([bytes], name, { type: mime }));
-    }
-    return { files, paths: filePaths, defaultSaveDir };
+    const paths = selectedPaths
+      .map((p) => (typeof p === "string" ? p : (p as { path?: string }).path ?? ""))
+      .filter(Boolean);
+    return filesFromPaths(paths);
+  } catch {
+    return null;
+  }
+}
+
+/** Načte soubory podle cest z nativního Tauri drag&drop eventu. */
+export async function openDroppedPathsViaTauri(paths: string[]): Promise<OpenFilesResult | null> {
+  if (!isTauri()) return null;
+  try {
+    return filesFromPaths(paths);
   } catch {
     return null;
   }
@@ -103,35 +123,32 @@ export async function saveBlobToFolder(
   overwriteStrategy: OverwriteStrategy = "overwrite"
 ): Promise<string | null> {
   if (!isTauri()) return null;
-  try {
-    const { writeFile, exists } = await import("@tauri-apps/plugin-fs");
-    const sep = outputFolder.includes("/") ? "/" : "\\";
-    let targetPath = `${outputFolder.replace(/[/\\]*$/, "")}${sep}${suggestedName}`;
+  const { writeFile, exists } = await import("@tauri-apps/plugin-fs");
+  const sep = outputFolder.includes("/") ? "/" : "\\";
+  const normalizedFolder = outputFolder.replace(/[/\\]*$/, "");
+  let targetPath = `${normalizedFolder}${sep}${suggestedName}`;
 
-    if (overwriteStrategy !== "overwrite") {
-      const fileExists = await exists(targetPath);
-      if (fileExists) {
-        if (overwriteStrategy === "skip") return null;
-        // suffix: přidej _1, _2, … před .pdf
-        const dotIdx = suggestedName.lastIndexOf(".");
-        const base = dotIdx >= 0 ? suggestedName.slice(0, dotIdx) : suggestedName;
-        const ext = dotIdx >= 0 ? suggestedName.slice(dotIdx) : "";
-        let n = 1;
-        let candidate = `${outputFolder.replace(/[/\\]*$/, "")}${sep}${base}_${n}${ext}`;
-        while (await exists(candidate)) {
-          n++;
-          candidate = `${outputFolder.replace(/[/\\]*$/, "")}${sep}${base}_${n}${ext}`;
-        }
-        targetPath = candidate;
+  if (overwriteStrategy !== "overwrite") {
+    const fileExists = await exists(targetPath);
+    if (fileExists) {
+      if (overwriteStrategy === "skip") return null;
+      // suffix: přidej _1, _2, … před .pdf
+      const dotIdx = suggestedName.lastIndexOf(".");
+      const base = dotIdx >= 0 ? suggestedName.slice(0, dotIdx) : suggestedName;
+      const ext = dotIdx >= 0 ? suggestedName.slice(dotIdx) : "";
+      let n = 1;
+      let candidate = `${normalizedFolder}${sep}${base}_${n}${ext}`;
+      while (await exists(candidate)) {
+        n++;
+        candidate = `${normalizedFolder}${sep}${base}_${n}${ext}`;
       }
+      targetPath = candidate;
     }
-
-    const buf = await blob.arrayBuffer();
-    await writeFile(targetPath, new Uint8Array(buf));
-    return targetPath;
-  } catch {
-    return null;
   }
+
+  const buf = await blob.arrayBuffer();
+  await writeFile(targetPath, new Uint8Array(buf));
+  return targetPath;
 }
 
 /**

@@ -3,6 +3,10 @@
 import { useEffect, useRef, useState } from "react";
 
 const MAX_PREVIEW_PX = 400;
+const PDFJS_WORKER_SRC = new URL(
+  "pdfjs-dist/build/pdf.worker.mjs",
+  import.meta.url
+).toString();
 
 interface PdfPreviewProps {
   file: File | null;
@@ -15,7 +19,8 @@ export function PdfPreview({ file, maxSize = MAX_PREVIEW_PX }: PdfPreviewProps) 
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!file || file.type !== "application/pdf") {
+    const isPdf = file?.type === "application/pdf" || file?.name.toLowerCase().endsWith(".pdf");
+    if (!file || !isPdf) {
       setError(null);
       return;
     }
@@ -25,7 +30,7 @@ export function PdfPreview({ file, maxSize = MAX_PREVIEW_PX }: PdfPreviewProps) 
     const load = async () => {
       if (typeof window === "undefined") return;
       const pdfjs = await import("pdfjs-dist");
-      pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.mjs`;
+      pdfjs.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_SRC;
 
       try {
         const bytes = await file.arrayBuffer();
@@ -65,7 +70,8 @@ export function PdfPreview({ file, maxSize = MAX_PREVIEW_PX }: PdfPreviewProps) 
     };
   }, [file, maxSize]);
 
-  if (!file || file.type !== "application/pdf") return null;
+  const isPdf = file?.type === "application/pdf" || file?.name.toLowerCase().endsWith(".pdf");
+  if (!file || !isPdf) return null;
   if (error) return <p className="text-sm text-amber-600">{error}</p>;
 
   return (

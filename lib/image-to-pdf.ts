@@ -77,6 +77,7 @@ export function createPageInfoFromDimensionsMm(
   const box = { x: 0, y: 0, width: widthPt, height: heightPt };
   return {
     pageIndex: 0,
+    userUnit: 1,
     mediaBox: box,
     cropBox: box,
     bleedBox: box,

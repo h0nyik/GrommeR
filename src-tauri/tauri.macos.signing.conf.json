@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "macOS": {
+      "hardenedRuntime": true,
+      "signingIdentity": "Developer ID Application: YOUR NAME (TEAMID)",
+      "providerShortName": "TEAMID"
+    }
+  }
+}

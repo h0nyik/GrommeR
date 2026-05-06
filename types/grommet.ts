@@ -56,6 +56,8 @@ export interface PdfBox {
 export interface PdfPageInfo {
   /** Pořadí stránky (0-based) */
   pageIndex: number;
+  /** PDF UserUnit; fyzické rozměry stránky jsou boxy × UserUnit. */
+  userUnit: number;
   /** MediaBox – vždy přítomen */
   mediaBox: PdfBox;
   /** CropBox – v pdf-lib výchozí = MediaBox */

@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Grommet Marks",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "identifier": "cz.grommet.marksapp",
   "build": {
     "frontendDist": "../out",
@@ -39,6 +39,17 @@
       "dmg": {
         "appPosition": { "x": 180, "y": 220 },
         "applicationFolderPosition": { "x": 480, "y": 220 }
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU5QjVCNkRGRUZDREJERjQKUldUMHZjM3YzN2ExNll4VU5laTJsQUh5alZ5ZnF1NXZLNXRGWDRSaVJ3RlRhV2x1ek1BcDJnOTAK",
+      "endpoints": [
+        "https://github.com/h0nyik/GrommeR/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

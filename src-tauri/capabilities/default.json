@@ -9,6 +9,9 @@
     "core:default",
     "dialog:allow-open",
     "dialog:allow-save",
+    "opener:default",
+    "process:default",
+    "updater:default",
     {
       "identifier": "fs:allow-read-file",
       "allow": [

@@ -84,7 +84,15 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         run: npm run tauri build
+
+      - name: Build Tauri app + updater artefakty
+        if: startsWith(github.ref, 'refs/tags/')
+        run: npm run tauri build -- --config src-tauri/tauri.updater.conf.json
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Portable exe pro release (přejmenovaný app.exe)
         if: matrix.os == 'windows-latest'
@@ -101,7 +109,9 @@ jobs:
           path: |
             GrommeR_portable.exe
             src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
             src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.msi.sig
           if-no-files-found: error
 
       - name: Upload artefaktů (Linux)
@@ -120,6 +130,8 @@ jobs:
           name: tauri-${{ matrix.name }}
           path: |
             src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.tar.gz
+            src-tauri/target/release/bundle/macos/*.tar.gz.sig
           if-no-files-found: error
 
   release:
@@ -129,11 +141,17 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Stáhnout build artefakty
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
           merge-multiple: true
+
+      - name: Vytvořit latest.json pro Tauri updater
+        run: node scripts/create-tauri-latest-json.cjs artifacts "${{ github.ref_name }}" "https://github.com/h0nyik/GrommeR"
 
       - name: Vytvořit release a nahrát soubory
         uses: softprops/action-gh-release@v2
@@ -147,6 +165,8 @@ jobs:
             | Windows | NSIS/MSI + `GrommeR_portable.exe` (portable, bez instalace) v `tauri-Windows x64` |
             | Linux | `tauri-Linux x64` |
             | macOS Apple Silicon | DMG (`*.dmg`) v `tauri-macos Apple Silicon` – přetáhnout aplikaci do „Aplikace“ |
+
+            Soubor `latest.json` slouží instalovaným desktopovým verzím pro automatickou kontrolu aktualizací.
 
             Repozitář: [h0nyik/GrommeR](https://github.com/h0nyik/GrommeR)
           files: artifacts/**

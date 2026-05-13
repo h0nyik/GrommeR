@@ -1,6 +1,17 @@
 "use client";
 
 import { useCallback, useState } from "react";
+import packageJson from "@/package.json";
+import { openExternalUrl } from "@/lib/tauri-bridge";
+
+const GITHUB_NEW_ISSUE_URL = "https://github.com/h0nyik/GrommeR/issues/new";
+
+function getIssueTitle(description: string): string {
+  const firstLine = description.trim().split(/\r?\n/)[0]?.trim();
+  return firstLine
+    ? `[Chyba] ${firstLine.slice(0, 80)}`
+    : "[Chyba] Grommet Marks";
+}
 
 function getEnvInfo(): string {
   if (typeof window === "undefined") return "";
@@ -9,7 +20,8 @@ function getEnvInfo(): string {
   const url = window.location.href;
   const w = window.innerWidth;
   const h = window.innerHeight;
-  return `Prohlížeč: ${ua}\nJazyk: ${lang}\nURL: ${url}\nRozlišení okna: ${w}×${h}\n`;
+  const platform = navigator.platform || "(nezjištěno)";
+  return `Verze aplikace: ${packageJson.version}\nPlatforma: ${platform}\nProhlížeč/WebView: ${ua}\nJazyk: ${lang}\nURL: ${url}\nRozlišení okna: ${w}×${h}\n`;
 }
 
 export function BugReportButton() {
@@ -17,9 +29,10 @@ export function BugReportButton() {
   const [description, setDescription] = useState("");
   const [steps, setSteps] = useState("");
   const [copied, setCopied] = useState(false);
+  const [openingIssue, setOpeningIssue] = useState(false);
 
   const buildReport = useCallback(() => {
-    const body = `--- Popis chyby ---\n\n${description || "(neuvedeno)"}\n\n--- Kroky k reprodukci ---\n\n${steps || "(neuvedeno)"}\n\n--- Prostředí ---\n${getEnvInfo()}Datum: ${new Date().toISOString()}`;
+    const body = `## Popis chyby\n\n${description || "(neuvedeno)"}\n\n## Kroky k reprodukci\n\n${steps || "(neuvedeno)"}\n\n## Prostředí\n\n${getEnvInfo()}Datum: ${new Date().toISOString()}`;
     return body;
   }, [description, steps]);
 
@@ -31,11 +44,19 @@ export function BugReportButton() {
     });
   }, [buildReport]);
 
-  const handleMailto = useCallback(() => {
-    const body = encodeURIComponent(buildReport());
-    const subject = encodeURIComponent("[Grommet Marks] Nahlášení chyby");
-    window.location.href = `mailto:?subject=${subject}&body=${body}`;
-  }, [buildReport]);
+  const handleOpenIssue = useCallback(async () => {
+    setOpeningIssue(true);
+    try {
+      const params = new URLSearchParams({
+        title: getIssueTitle(description),
+        body: buildReport(),
+        labels: "bug",
+      });
+      await openExternalUrl(`${GITHUB_NEW_ISSUE_URL}?${params.toString()}`);
+    } finally {
+      setOpeningIssue(false);
+    }
+  }, [buildReport, description]);
 
   return (
     <>
@@ -63,7 +84,7 @@ export function BugReportButton() {
               Nahlášení chyby
             </h2>
             <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-              Popište problém a kroky, jak ho zopakovat. Údaje o prohlížeči a prostředí se přidají automaticky.
+              Popište problém a kroky, jak ho zopakovat. Aplikace otevře GitHub Issue s předvyplněnou verzí, prostředím a časem hlášení.
             </p>
 
             <label className="mt-3 block text-sm font-medium text-zinc-700 dark:text-zinc-300">
@@ -98,10 +119,11 @@ export function BugReportButton() {
               </button>
               <button
                 type="button"
-                onClick={handleMailto}
-                className="rounded bg-zinc-200 px-3 py-1.5 text-sm font-medium text-zinc-800 hover:bg-zinc-300 dark:bg-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-600"
+                onClick={handleOpenIssue}
+                disabled={openingIssue}
+                className="rounded bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                Otevřít e-mail
+                {openingIssue ? "Otevírám GitHub…" : "Otevřít GitHub Issue"}
               </button>
               <button
                 type="button"

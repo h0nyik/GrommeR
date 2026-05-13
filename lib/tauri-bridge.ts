@@ -19,6 +19,36 @@ export function isTauri(): boolean {
   return !!(window.__TAURI__ ?? window.__TAURI_INTERNALS__);
 }
 
+export interface AppRuntimeInfo {
+  version: string;
+  executableName: string | null;
+  isPortable: boolean;
+}
+
+/**
+ * Otevře externí URL v systémovém prohlížeči.
+ * V Tauri používá opener plugin, ve webu běžné window.open.
+ */
+export async function openExternalUrl(url: string): Promise<void> {
+  if (isTauri()) {
+    const { openUrl } = await import("@tauri-apps/plugin-opener");
+    await openUrl(url);
+    return;
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+/** Vrátí runtime informace z desktopové části aplikace. */
+export async function getAppRuntimeInfo(): Promise<AppRuntimeInfo | null> {
+  if (!isTauri()) return null;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<AppRuntimeInfo>("get_app_runtime_info");
+  } catch {
+    return null;
+  }
+}
+
 /** Výsledek otevření souborů v Tauri: soubory + jejich plné cesty + adresář prvního souboru. */
 export type OpenFilesResult = {
   files: File[];

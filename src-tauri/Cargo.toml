@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.2.3"
+version = "0.2.4"
 description = "Grommet Marks App – generátor značek průchodek do tiskových PDF bannerů"
 authors = ["h0nyik"]
 license = "MIT"
@@ -25,3 +25,6 @@ tauri = { version = "2.10.0", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-log = "2"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2.3.1"
+tauri-plugin-opener = "2.5.4"

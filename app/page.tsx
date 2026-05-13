@@ -1,6 +1,7 @@
 import { AnalyticsConsent } from "@/components/AnalyticsConsent";
 import { BugReportButton } from "@/components/BugReportButton";
 import { GrommetForm } from "@/components/GrommetForm";
+import { UpdateStatus } from "@/components/UpdateStatus";
 
 export default function Home() {
   return (
@@ -17,6 +18,7 @@ export default function Home() {
         </div>
         <footer className="mt-10 flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-center">
           <BugReportButton />
+          <UpdateStatus />
           <AnalyticsConsent />
         </footer>
       </main>

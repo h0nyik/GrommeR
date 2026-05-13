@@ -1,6 +1,6 @@
 {
   "name": "grommet-marks-app",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -17,6 +17,9 @@
     "@tauri-apps/api": "2.10.1",
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-fs": "^2.4.5",
+    "@tauri-apps/plugin-opener": "^2.5.4",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "next": "16.1.6",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^5.4.624",

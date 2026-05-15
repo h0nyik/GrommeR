@@ -5,6 +5,7 @@
  */
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { execSync } = require("child_process");
 
@@ -37,10 +38,22 @@ function findAppFolder() {
 
 const appFolder = findAppFolder();
 const zipPath = path.join(rootDir, zipName);
+const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "grommet-marks-portable-"));
+const tempAppFolder = path.join(tempRoot, path.basename(appFolder));
+
+fs.cpSync(appFolder, tempAppFolder, { recursive: true });
+
+const exeName = fs.readdirSync(tempAppFolder).find((file) => file.toLowerCase().endsWith(".exe"));
+if (exeName) {
+  fs.renameSync(
+    path.join(tempAppFolder, exeName),
+    path.join(tempAppFolder, `${productName}_portable.exe`)
+  );
+}
 
 try {
   execSync(
-    `Compress-Archive -LiteralPath "${appFolder}" -DestinationPath "${zipPath}" -Force`,
+    `Compress-Archive -LiteralPath "${tempAppFolder}" -DestinationPath "${zipPath}" -Force`,
     { stdio: "inherit", shell: "powershell" }
   );
   console.log(`Portable ZIP vytvořen: ${zipName}`);
@@ -48,4 +61,6 @@ try {
 } catch (err) {
   console.error("Vytvoření ZIP selhalo:", err.message);
   process.exit(1);
+} finally {
+  fs.rmSync(tempRoot, { recursive: true, force: true });
 }

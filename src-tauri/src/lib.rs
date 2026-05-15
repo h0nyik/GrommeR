@@ -18,7 +18,7 @@ fn get_app_runtime_info(app: tauri::AppHandle) -> AppRuntimeInfo {
       .as_deref()
       .map(|name| {
         let lower = name.to_lowercase();
-        lower.contains("portable") || lower == "app.exe"
+        lower.contains("portable")
       })
       .unwrap_or(false);
 

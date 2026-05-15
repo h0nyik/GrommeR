@@ -31,10 +31,12 @@ interface AvailableUpdate {
   notes?: string;
   downloadUrl?: string;
   releaseUrl?: string;
+  manualDownload?: boolean;
 }
 
 type UpdateMode = "installed" | "portable";
 type UpdateState = "idle" | "checking" | "available" | "current" | "downloading" | "error" | "hidden";
+type ReleaseAssetKind = "installer" | "portable";
 
 function normalizeVersion(version: string): number[] {
   return version
@@ -59,7 +61,17 @@ function isNewerVersion(candidate: string, current: string): boolean {
 function findPortableAsset(assets: GithubReleaseAsset[] | undefined): GithubReleaseAsset | null {
   return (
     assets?.find((asset) => /portable/i.test(asset.name) && /\.(exe|zip)$/i.test(asset.name)) ??
-    assets?.find((asset) => /\.(exe|zip)$/i.test(asset.name)) ??
+    assets?.find((asset) => /\.zip$/i.test(asset.name)) ??
+    assets?.find((asset) => /\.(exe)$/i.test(asset.name) && !/setup|installer/i.test(asset.name)) ??
+    null
+  );
+}
+
+function findInstallerAsset(assets: GithubReleaseAsset[] | undefined): GithubReleaseAsset | null {
+  return (
+    assets?.find((asset) => /setup/i.test(asset.name) && /\.exe$/i.test(asset.name)) ??
+    assets?.find((asset) => /\.msi$/i.test(asset.name)) ??
+    assets?.find((asset) => /\.(exe)$/i.test(asset.name) && !/portable/i.test(asset.name)) ??
     null
   );
 }
@@ -73,7 +85,10 @@ export function UpdateStatus() {
   const [progress, setProgress] = useState<number | null>(null);
   const updateRef = useRef<Update | null>(null);
 
-  const checkPortableUpdate = useCallback(async (currentVersion: string): Promise<AvailableUpdate | null> => {
+  const checkGithubReleaseUpdate = useCallback(async (
+    currentVersion: string,
+    assetKind: ReleaseAssetKind
+  ): Promise<AvailableUpdate | null> => {
     const response = await fetch(GITHUB_RELEASES_API, {
       headers: { Accept: "application/vnd.github+json" },
     });
@@ -83,25 +98,40 @@ export function UpdateStatus() {
     const version = release.tag_name ?? release.name ?? "";
     if (!version || !isNewerVersion(version, currentVersion)) return null;
 
-    const portableAsset = findPortableAsset(release.assets);
+    const asset =
+      assetKind === "portable"
+        ? findPortableAsset(release.assets)
+        : findInstallerAsset(release.assets);
     return {
       version,
       notes: release.body,
-      downloadUrl: portableAsset?.browser_download_url,
+      downloadUrl: asset?.browser_download_url,
       releaseUrl: release.html_url ?? GITHUB_RELEASES_URL,
     };
   }, []);
 
-  const checkInstalledUpdate = useCallback(async (): Promise<AvailableUpdate | null> => {
+  const checkPortableUpdate = useCallback(
+    async (currentVersion: string): Promise<AvailableUpdate | null> =>
+      checkGithubReleaseUpdate(currentVersion, "portable"),
+    [checkGithubReleaseUpdate]
+  );
+
+  const checkInstalledUpdate = useCallback(async (currentVersion: string): Promise<AvailableUpdate | null> => {
     const { check } = await import("@tauri-apps/plugin-updater");
-    const update = await check({ timeout: 30_000 });
-    updateRef.current = update;
-    if (!update) return null;
-    return {
-      version: update.version,
-      notes: update.body,
-    };
-  }, []);
+    try {
+      const update = await check({ timeout: 30_000 });
+      updateRef.current = update;
+      if (!update) return null;
+      return {
+        version: update.version,
+        notes: update.body,
+      };
+    } catch {
+      updateRef.current = null;
+      const releaseUpdate = await checkGithubReleaseUpdate(currentVersion, "installer");
+      return releaseUpdate ? { ...releaseUpdate, manualDownload: true } : null;
+    }
+  }, [checkGithubReleaseUpdate]);
 
   const checkForUpdates = useCallback(
     async (silent = false) => {
@@ -124,7 +154,7 @@ export function UpdateStatus() {
         const nextMode: UpdateMode = info.isPortable ? "portable" : "installed";
         const update = info.isPortable
           ? await checkPortableUpdate(info.version)
-          : await checkInstalledUpdate();
+          : await checkInstalledUpdate(info.version);
 
         setRuntimeInfo(info);
         setMode(nextMode);
@@ -135,6 +165,8 @@ export function UpdateStatus() {
           setMessage(
             nextMode === "portable"
               ? `Je dostupná portable verze ${update.version}.`
+              : update.manualDownload
+                ? `Je dostupná verze ${update.version}, ale automatická instalace pro tento release není připravená.`
               : `Je dostupná aktualizace ${update.version}.`
           );
           return;
@@ -160,7 +192,7 @@ export function UpdateStatus() {
       return;
     }
 
-    if (mode === "portable") {
+    if (mode === "portable" || availableUpdate.manualDownload) {
       await openExternalUrl(availableUpdate.downloadUrl ?? availableUpdate.releaseUrl ?? GITHUB_RELEASES_URL);
       return;
     }
@@ -204,6 +236,8 @@ export function UpdateStatus() {
     state === "available"
       ? mode === "portable"
         ? "Stáhnout novou verzi"
+        : availableUpdate?.manualDownload
+          ? "Stáhnout instalátor"
         : "Aktualizovat"
       : state === "checking"
         ? "Kontroluji…"

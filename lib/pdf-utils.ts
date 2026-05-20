@@ -4,7 +4,15 @@
  * Barevný prostor existujícího obsahu PDF neměníme – přidáváme pouze nové vektorové značky (RGB).
  */
 
-import { PDFDocument, PDFName, PDFNumber, rgb, cmyk, type PDFPage } from "pdf-lib";
+import {
+  PDFDocument,
+  PDFName,
+  PDFNumber,
+  rgb,
+  cmyk,
+  type PDFEmbeddedPage,
+  type PDFPage,
+} from "pdf-lib";
 import type { MarkPosition } from "@/types/grommet";
 import type { GrommetMarksParams, MarkColor } from "@/types/grommet";
 import type { PdfBox, PdfPageInfo } from "@/types/grommet";
@@ -27,6 +35,48 @@ export function normalizeDrawingScale(value: number | undefined): number {
   if (value < 1) return 1;
   if (value > DRAWING_SCALE_MAX) return DRAWING_SCALE_MAX;
   return value;
+}
+
+/** Převede neznámou výjimku na čitelný text pro UI. */
+export function extractErrorMessage(err: unknown, fallback: string): string {
+  if (err instanceof Error && err.message.trim()) return err.message;
+  if (typeof err === "string" && err.trim()) return err;
+  if (err && typeof err === "object" && "message" in err) {
+    const message = (err as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+  }
+  return fallback;
+}
+
+/**
+ * Vloží zdrojovou stránku do výstupního dokumentu.
+ * Některé PDF z DTP nástrojů nejdou přes embedPage – pak použijeme copyPages.
+ */
+async function embedSourcePageForDraw(
+  outDoc: PDFDocument,
+  srcDoc: PDFDocument,
+  pageIndex: number
+): Promise<PDFEmbeddedPage> {
+  const srcPage = srcDoc.getPages()[pageIndex];
+  try {
+    return await outDoc.embedPage(srcPage);
+  } catch (embedErr) {
+    try {
+      const tempDoc = await PDFDocument.create();
+      const [copied] = await tempDoc.copyPages(srcDoc, [pageIndex]);
+      tempDoc.addPage(copied);
+      return await outDoc.embedPage(copied);
+    } catch (copyErr) {
+      const embedMsg = extractErrorMessage(embedErr, "");
+      const copyMsg = extractErrorMessage(copyErr, "");
+      const details = [embedMsg, copyMsg].filter(Boolean).join("; ");
+      throw new Error(
+        details
+          ? `PDF stránku nelze vložit do výstupu: ${details}. Zkuste soubor znovu exportovat z grafického programu.`
+          : "PDF stránku nelze vložit do výstupu. Zkuste soubor znovu exportovat z grafického programu."
+      );
+    }
+  }
 }
 
 function getPdfPageUserUnit(page: PDFPage): number {
@@ -214,7 +264,7 @@ async function addGrommetMarksToScaledPdf(
   const srcPage = srcPages[0];
   const srcInfo = getPageInfo(srcPage, 0);
   const outDoc = await PDFDocument.create();
-  const embedded = await outDoc.embedPage(srcPage);
+  const embedded = await embedSourcePageForDraw(outDoc, srcDoc, 0);
   const outputWidthMm = targetSizeMm?.widthMm ?? srcInfo.widthMm * scale;
   const outputHeightMm = targetSizeMm?.heightMm ?? srcInfo.heightMm * scale;
   const page = addPhysicalSizePage(outDoc, outputWidthMm, outputHeightMm);
@@ -255,28 +305,12 @@ export async function addGrommetMarksToPdf(
   options?: AddGrommetMarksToPdfOptions
 ): Promise<Uint8Array> {
   const scale = normalizeDrawingScale(options?.drawingScale);
-  const targetSizeMm = options?.targetSizeMm;
-  if (scale > 1 || targetSizeMm) {
-    return addGrommetMarksToScaledPdf(pdfBytes, grommetParams, drawOptions, scale, targetSizeMm);
-  }
-
-  const doc = await loadPdfDocument(pdfBytes);
-  const pages = doc.getPages();
-  if (pages.length === 0) throw new Error("PDF neobsahuje žádnou stránku.");
-
-  const page = pages[0];
-  const info = getPageInfo(page, 0);
-
-  const params: GrommetMarksParams = {
-    ...grommetParams,
-    widthMm: info.widthMm,
-    heightMm: info.heightMm,
-  };
-  const { positions } = computeGrommetMarks(params);
-  drawMarksOnPage(page, positions, drawOptions);
-
-  // Vždy export čistého TrimBoxu: stránka = pouze rozměr TrimBoxu, bez ořezových značek a bleedu
-  normalizePageBoxesToTrim(page);
-
-  return doc.save();
+  // Vždy nový dokument: spolehlivější u velkých plachet a PDF z DTP (bleed, UserUnit, složité boxy).
+  return addGrommetMarksToScaledPdf(
+    pdfBytes,
+    grommetParams,
+    drawOptions,
+    scale,
+    options?.targetSizeMm
+  );
 }

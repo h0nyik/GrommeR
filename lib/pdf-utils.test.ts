@@ -170,6 +170,46 @@ describe("addGrommetMarksToPdf", () => {
     expect(outInfo.heightMm).toBeCloseTo(srcInfo.heightMm * 2, 4);
   });
 
+  it("zpracuje plátno 2450×1300 mm při měřítku 1:1 (typická plachta)", async () => {
+    const MM_TO_PT = 72 / 25.4;
+    const wMm = 2450;
+    const hMm = 1300;
+    const doc = await PDFDocument.create();
+    const page = doc.addPage([wMm * MM_TO_PT, hMm * MM_TO_PT]);
+    page.drawRectangle({
+      x: 10,
+      y: 10,
+      width: wMm * MM_TO_PT - 20,
+      height: hMm * MM_TO_PT - 20,
+      borderColor: rgb(0, 0, 0),
+      borderWidth: 1,
+    });
+    const bytes = await doc.save();
+
+    const result = await addGrommetMarksToPdf(
+      bytes,
+      {
+        widthMm: wMm,
+        heightMm: hMm,
+        edges: ["top", "bottom", "left", "right"],
+        offsetXMm: 2.8,
+        offsetYMm: 2.8,
+        mode: "spacing",
+        spacingMm: 480,
+      },
+      {
+        shape: "circle",
+        sizeMm: 5,
+        borderColor: { type: "rgb", r: 0, g: 0, b: 0 },
+      },
+      { drawingScale: 1 }
+    );
+
+    expect(result.length).toBeGreaterThan(100);
+    const outDoc = await loadPdfDocument(result);
+    expect(outDoc.getPages().length).toBe(1);
+  });
+
   it("podporuje velké cílové plátno přes PDF UserUnit", async () => {
     const bytes = await createMinimalPdf();
     const result = await addGrommetMarksToPdf(

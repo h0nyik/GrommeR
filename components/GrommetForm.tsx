@@ -9,6 +9,7 @@ import {
 import { generateOutputFilename } from "@/lib/output-filename";
 import {
   addGrommetMarksToPdf,
+  extractErrorMessage,
   getPageInfo,
   loadPdfDocument,
   normalizeDrawingScale,
@@ -357,7 +358,12 @@ export function GrommetForm() {
         }
         return { ...item, bytes, pageInfo: info, status: "ready", error: null };
       } catch (err) {
-        return { ...item, bytes: null, status: "error", error: err instanceof Error ? err.message : "Chyba načtení." };
+        return {
+          ...item,
+          bytes: null,
+          status: "error",
+          error: extractErrorMessage(err, "Chyba načtení."),
+        };
       }
     },
     []
@@ -411,7 +417,7 @@ export function GrommetForm() {
             setPageInfo(createPageInfoFromDimensionsMm(dim.widthMm, dim.heightMm));
           }
         } catch (err) {
-          setError(err instanceof Error ? err.message : "Nepodařilo se načíst soubor.");
+          setError(extractErrorMessage(err, "Nepodařilo se načíst soubor."));
         }
         return;
       }
@@ -686,7 +692,7 @@ export function GrommetForm() {
         if (skipped) batchSkippedCount++;
         else batchSuccessCount++;
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Chyba";
+        const msg = extractErrorMessage(err, "Chyba při generování PDF.");
         track({ type: "error", message: msg, context: "batch" });
         setBatchItems((prev) =>
           prev.map((i) =>
@@ -796,7 +802,7 @@ export function GrommetForm() {
       }
       track({ type: "pdf_generated", single: true });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Chyba při generování PDF.";
+      const msg = extractErrorMessage(err, "Chyba při generování PDF.");
       track({ type: "error", message: msg, context: "single" });
       setError(msg);
     } finally {

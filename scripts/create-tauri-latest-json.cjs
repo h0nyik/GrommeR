@@ -11,6 +11,7 @@ const artifactsDir = path.resolve(process.argv[2] || "artifacts");
 const tagName = process.argv[3] || process.env.GITHUB_REF_NAME || "";
 const repoUrl = (process.argv[4] || "https://github.com/h0nyik/GrommeR").replace(/\/$/, "");
 const outputFilename = process.argv[5] || "latest.json";
+const downloadTag = process.argv[6] || tagName;
 
 if (!tagName) {
   console.error("Chybí název tagu/verze pro latest.json.");
@@ -26,7 +27,7 @@ function walk(dir) {
 }
 
 function releaseAssetUrl(filename) {
-  return `${repoUrl}/releases/download/${encodeURIComponent(tagName)}/${encodeURIComponent(filename)}`;
+  return `${repoUrl}/releases/download/${encodeURIComponent(downloadTag)}/${encodeURIComponent(filename)}`;
 }
 
 function pickSignedAsset(files, matcher, prefer) {
@@ -73,8 +74,12 @@ if (Object.keys(platforms).length === 0) {
   process.exit(1);
 }
 
+function normalizeTagVersion(tag) {
+  return tag.replace(/^test-v/i, "").replace(/^v/i, "");
+}
+
 const manifest = {
-  version: tagName.replace(/^v/i, ""),
+  version: normalizeTagVersion(tagName),
   notes: `Automatická aktualizace ${tagName}.`,
   pub_date: new Date().toISOString(),
   platforms,

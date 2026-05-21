@@ -138,14 +138,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          node scripts/create-tauri-latest-json.cjs artifacts "${{ github.ref_name }}" "https://github.com/h0nyik/GrommeR" latest-test.json updater-test
+          shopt -s globstar nullglob
+          files=(artifacts/*.exe artifacts/*.exe.sig artifacts/*.msi artifacts/*.msi.sig artifacts/latest-test.json artifacts/GrommeR_portable.exe)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "Žádné soubory k nahrání do updater-test."
+            exit 1
+          fi
           if gh release view updater-test >/dev/null 2>&1; then
-            gh release upload updater-test artifacts/** --clobber
+            gh release upload updater-test "${files[@]}" --clobber
           else
             gh release create updater-test \
               --prerelease \
               --title "Auto-update test channel" \
               --notes "Stabilní URL pro testování updateru. Soubory se přepisují při každém tagu test-v*." \
-              artifacts/**
+              "${files[@]}"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

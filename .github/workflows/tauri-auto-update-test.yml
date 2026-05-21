@@ -145,7 +145,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Aktualizovat test kanál updater-test
-        if: steps.latest_json.outcome == 'success'
+        if: steps.latest_json.outcome == 'success' && github.ref_name != 'test-v0.2.7'
         shell: bash
         run: |
           set -euo pipefail

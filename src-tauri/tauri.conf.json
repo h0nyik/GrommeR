@@ -44,7 +44,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU5QjVCNkRGRUZDREJERjQKUldUMHZjM3YzN2ExNll4VU5laTJsQUh5alZ5ZnF1NXZLNXRGWDRSaVJ3RlRhV2x1ek1BcDJnOTAK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg0MTQ4RjZDRkQxOTY2NzkKUldSNVpobjliSThVaEc3a3ZDRVNadDQzK3E5bnlOSHNyN3YyeVUwOEliS2FNOWVaOG43V0czK08K",
       "endpoints": [
         "https://github.com/h0nyik/GrommeR/releases/latest/download/latest.json"
       ],

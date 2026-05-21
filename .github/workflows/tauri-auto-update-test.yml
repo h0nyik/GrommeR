@@ -64,7 +64,7 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app (test updater endpoint)
-        run: npm run tauri build -- --config src-tauri/tauri.updater.conf.json --config src-tauri/tauri.test.conf.json
+        run: npm run tauri build -- --config src-tauri/tauri.test.conf.json
 
       - name: Podepsat updater artefakty (test tag)
         if: startsWith(github.ref, 'refs/tags/test-v')

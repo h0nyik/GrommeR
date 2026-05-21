@@ -113,25 +113,36 @@ jobs:
         run: node scripts/create-tauri-latest-json.cjs artifacts "${{ github.ref_name }}" "https://github.com/h0nyik/GrommeR" latest-test.json
 
       - name: Vytvořit pre-release pro test tag
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: Grommet Marks ${{ github.ref_name }} (updater test)
-          prerelease: true
-          body: |
-            **Testovací build pro auto-update** – není produkční release.
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(artifacts/*.exe artifacts/*.exe.sig artifacts/*.msi artifacts/*.msi.sig artifacts/latest-test.json artifacts/GrommeR_portable.exe)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "Žádné soubory k nahrání do release ${{ github.ref_name }}."
+            exit 1
+          fi
+          notes="**Testovací build pro auto-update** – není produkční release.
 
-            Updater endpoint v tomto buildu: `releases/download/updater-test/latest-test.json`
+          Updater endpoint v tomto buildu: \`releases/download/updater-test/latest-test.json\`
 
-            | Platforma | Zdroj |
-            |-----------|--------|
-            | Windows | NSIS/MSI + `GrommeR_portable.exe` |
+          | Platforma | Zdroj |
+          |-----------|--------|
+          | Windows | NSIS/MSI + \`GrommeR_portable.exe\` |
 
-            Po ověření updateru sloučit do `master` a vydat produkční tag `v*`.
-          files: artifacts/**
-          fail_on_unmatched_files: false
+          Po ověření updateru sloučit do \`master\` a vydat produkční tag \`v*\`."
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" "${files[@]}" --clobber
+            gh release edit "${{ github.ref_name }}" --prerelease --title "Grommet Marks ${{ github.ref_name }} (updater test)" --notes "$notes"
+          else
+            gh release create "${{ github.ref_name }}" \
+              --prerelease \
+              --title "Grommet Marks ${{ github.ref_name }} (updater test)" \
+              --notes "$notes" \
+              "${files[@]}"
+          fi
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Aktualizovat test kanál updater-test
         if: steps.latest_json.outcome == 'success'

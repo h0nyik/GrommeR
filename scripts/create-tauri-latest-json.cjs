@@ -10,6 +10,7 @@ const path = require("path");
 const artifactsDir = path.resolve(process.argv[2] || "artifacts");
 const tagName = process.argv[3] || process.env.GITHUB_REF_NAME || "";
 const repoUrl = (process.argv[4] || "https://github.com/h0nyik/GrommeR").replace(/\/$/, "");
+const outputFilename = process.argv[5] || "latest.json";
 
 if (!tagName) {
   console.error("Chybí název tagu/verze pro latest.json.");
@@ -79,7 +80,7 @@ const manifest = {
   platforms,
 };
 
-const outputPath = path.join(artifactsDir, "latest.json");
+const outputPath = path.join(artifactsDir, outputFilename);
 fs.writeFileSync(outputPath, `${JSON.stringify(manifest, null, 2)}\n`);
 console.log(`Vytvořen manifest updateru: ${outputPath}`);
 console.log(`Platformy: ${Object.keys(platforms).join(", ")}`);

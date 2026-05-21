@@ -1,0 +1,9 @@
+{
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/h0nyik/GrommeR/releases/download/updater-test/latest-test.json"
+      ]
+    }
+  }
+}

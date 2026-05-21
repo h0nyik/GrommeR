@@ -107,6 +107,17 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
+      - name: Srovnat stažené artefakty do kořene artifacts/
+        shell: bash
+        run: |
+          set -euo pipefail
+          find artifacts -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.sig' \) -exec cp -f {} artifacts/ \;
+          if [ -f artifacts/GrommeR_portable.exe ]; then
+            cp -f artifacts/GrommeR_portable.exe artifacts/GrommeR_portable.exe 2>/dev/null || true
+          fi
+          find artifacts -mindepth 2 -type f \( -name 'GrommeR_portable.exe' \) -exec cp -f {} artifacts/ \;
+          ls -la artifacts/
+
       - name: Vytvořit latest-test.json pro Tauri updater
         id: latest_json
         continue-on-error: true

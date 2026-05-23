@@ -12,6 +12,7 @@ import type { DownloadEvent, Update } from "@tauri-apps/plugin-updater";
 
 const GITHUB_RELEASES_API = "https://api.github.com/repos/h0nyik/GrommeR/releases/latest";
 const GITHUB_RELEASES_URL = "https://github.com/h0nyik/GrommeR/releases/latest";
+const DISMISSED_UPDATE_KEY = "grommet-dismissed-update-version";
 
 interface GithubReleaseAsset {
   name: string;
@@ -76,6 +77,15 @@ function findInstallerAsset(assets: GithubReleaseAsset[] | undefined): GithubRel
   );
 }
 
+function getDismissedUpdateVersion(): string | null {
+  if (typeof window === "undefined") return null;
+  return sessionStorage.getItem(DISMISSED_UPDATE_KEY);
+}
+
+function dismissUpdateVersion(version: string): void {
+  sessionStorage.setItem(DISMISSED_UPDATE_KEY, version);
+}
+
 export function UpdateStatus() {
   const [runtimeInfo, setRuntimeInfo] = useState<AppRuntimeInfo | null>(null);
   const [mode, setMode] = useState<UpdateMode>("installed");
@@ -83,7 +93,9 @@ export function UpdateStatus() {
   const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdate | null>(null);
   const [message, setMessage] = useState("");
   const [progress, setProgress] = useState<number | null>(null);
+  const [showUpdateDialog, setShowUpdateDialog] = useState(false);
   const updateRef = useRef<Update | null>(null);
+  const installInProgressRef = useRef(false);
 
   const checkGithubReleaseUpdate = useCallback(async (
     currentVersion: string,
@@ -124,7 +136,7 @@ export function UpdateStatus() {
       if (!update) return null;
       return {
         version: update.version,
-        notes: update.body,
+        notes: update.body ?? undefined,
       };
     } catch {
       updateRef.current = null;
@@ -167,8 +179,11 @@ export function UpdateStatus() {
               ? `Je dostupná portable verze ${update.version}.`
               : update.manualDownload
                 ? `Je dostupná verze ${update.version}, ale automatická instalace pro tento release není připravená.`
-              : `Je dostupná aktualizace ${update.version}.`
+                : `Je dostupná aktualizace ${update.version}.`
           );
+          if (getDismissedUpdateVersion() !== update.version) {
+            setShowUpdateDialog(true);
+          }
           return;
         }
 
@@ -186,7 +201,9 @@ export function UpdateStatus() {
     void checkForUpdates(true);
   }, [checkForUpdates]);
 
-  const handlePrimaryAction = useCallback(async () => {
+  const installUpdate = useCallback(async () => {
+    if (installInProgressRef.current) return;
+
     if (!availableUpdate) {
       await checkForUpdates(false);
       return;
@@ -203,31 +220,60 @@ export function UpdateStatus() {
       return;
     }
 
+    installInProgressRef.current = true;
+    setShowUpdateDialog(false);
     setState("downloading");
-    setMessage("Stahuji a instaluji aktualizaci…");
+    setMessage("Stahuji aktualizaci…");
     setProgress(null);
 
-    let downloaded = 0;
-    let total: number | undefined;
-    await update.downloadAndInstall((event: DownloadEvent) => {
-      if (event.event === "Started") {
-        downloaded = 0;
-        total = event.data.contentLength;
-        setProgress(total ? 0 : null);
-      }
-      if (event.event === "Progress") {
-        downloaded += event.data.chunkLength;
-        if (total) setProgress(Math.round((downloaded / total) * 100));
-      }
-      if (event.event === "Finished") {
-        setProgress(100);
-      }
-    });
+    try {
+      let downloaded = 0;
+      let total: number | undefined;
 
-    setMessage("Aktualizace je nainstalovaná, aplikace se restartuje.");
-    const { relaunch } = await import("@tauri-apps/plugin-process");
-    await relaunch();
+      await update.download((event: DownloadEvent) => {
+        if (event.event === "Started") {
+          downloaded = 0;
+          total = event.data.contentLength;
+          setProgress(total ? 0 : null);
+        }
+        if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          if (total) setProgress(Math.round((downloaded / total) * 100));
+        }
+        if (event.event === "Finished") {
+          setProgress(100);
+        }
+      });
+
+      setMessage("Instaluji aktualizaci… Aplikace se může zavřít. Potvrďte případné UAC okno (Alt+Tab).");
+      setProgress(null);
+      await update.install();
+
+      setMessage("Aktualizace je nainstalovaná, aplikace se restartuje.");
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (error) {
+      installInProgressRef.current = false;
+      setState("error");
+      setMessage(error instanceof Error ? error.message : "Instalace aktualizace selhala.");
+      setShowUpdateDialog(true);
+    }
   }, [availableUpdate, checkForUpdates, mode]);
+
+  const handleDismissUpdate = useCallback(() => {
+    if (availableUpdate) {
+      dismissUpdateVersion(availableUpdate.version);
+    }
+    setShowUpdateDialog(false);
+  }, [availableUpdate]);
+
+  const handlePrimaryAction = useCallback(async () => {
+    if (state === "available") {
+      setShowUpdateDialog(true);
+      return;
+    }
+    await checkForUpdates(false);
+  }, [checkForUpdates, state]);
 
   if (state === "hidden") return null;
 
@@ -238,26 +284,85 @@ export function UpdateStatus() {
         ? "Stáhnout novou verzi"
         : availableUpdate?.manualDownload
           ? "Stáhnout instalátor"
-        : "Aktualizovat"
+          : "Aktualizovat"
       : state === "checking"
         ? "Kontroluji…"
-        : "Zkontrolovat aktualizace";
+        : state === "downloading"
+          ? "Instaluji…"
+          : "Zkontrolovat aktualizace";
 
   return (
-    <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-sm text-zinc-500 dark:text-zinc-400">
-      <span>
-        Verze {currentVersion}
-        {message ? ` · ${message}` : ""}
-        {progress != null ? ` (${progress} %)` : ""}
-      </span>
-      <button
-        type="button"
-        onClick={handlePrimaryAction}
-        disabled={state === "checking" || state === "downloading"}
-        className="underline hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:text-zinc-300"
-      >
-        {buttonLabel}
-      </button>
-    </div>
+    <>
+      <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-sm text-zinc-500 dark:text-zinc-400">
+        <span>
+          Verze {currentVersion}
+          {message ? ` · ${message}` : ""}
+          {progress != null ? ` (${progress} %)` : ""}
+        </span>
+        <button
+          type="button"
+          onClick={handlePrimaryAction}
+          disabled={state === "checking" || state === "downloading"}
+          className="underline hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:text-zinc-300"
+        >
+          {buttonLabel}
+        </button>
+      </div>
+
+      {showUpdateDialog && availableUpdate && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={handleDismissUpdate}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="update-dialog-title"
+        >
+          <div
+            className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-lg border border-zinc-200 bg-white p-5 shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="update-dialog-title" className="text-lg font-semibold text-zinc-800 dark:text-zinc-100">
+              Dostupná aktualizace
+            </h2>
+            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
+              Je k dispozici nová verze <strong>{availableUpdate.version}</strong>.
+              {currentVersion ? ` Aktuálně máte verzi ${currentVersion}.` : ""}
+            </p>
+            {availableUpdate.notes ? (
+              <p className="mt-3 whitespace-pre-wrap rounded border border-zinc-200 bg-zinc-50 p-3 text-sm text-zinc-600 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
+                {availableUpdate.notes}
+              </p>
+            ) : null}
+            {state === "error" ? (
+              <p className="mt-3 text-sm text-red-600 dark:text-red-400">{message}</p>
+            ) : null}
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={handleDismissUpdate}
+                disabled={state === "downloading"}
+                className="rounded border border-zinc-300 px-4 py-2 text-sm text-zinc-700 hover:bg-zinc-50 disabled:opacity-60 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-800"
+              >
+                Později
+              </button>
+              <button
+                type="button"
+                onClick={() => void installUpdate()}
+                disabled={state === "downloading"}
+                className="rounded bg-zinc-800 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-60 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white"
+              >
+                {state === "downloading"
+                  ? progress != null
+                    ? `Stahuji… ${progress} %`
+                    : "Instaluji…"
+                  : mode === "portable" || availableUpdate.manualDownload
+                    ? "Stáhnout"
+                    : "Aktualizovat nyní"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }

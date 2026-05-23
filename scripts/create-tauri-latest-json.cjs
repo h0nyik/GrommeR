@@ -26,8 +26,14 @@ function walk(dir) {
   });
 }
 
+function githubReleaseAssetName(filename) {
+  // GitHub release upload přejmenovává mezery v názvech souborů na tečky.
+  return filename.replace(/ /g, ".");
+}
+
 function releaseAssetUrl(filename) {
-  return `${repoUrl}/releases/download/${encodeURIComponent(downloadTag)}/${encodeURIComponent(filename)}`;
+  const assetName = githubReleaseAssetName(filename);
+  return `${repoUrl}/releases/download/${encodeURIComponent(downloadTag)}/${encodeURIComponent(assetName)}`;
 }
 
 function pickSignedAsset(files, matcher, prefer) {

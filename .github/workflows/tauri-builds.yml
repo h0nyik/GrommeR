@@ -1,8 +1,8 @@
 name: Tauri Builds
 
 # Produkční workflow – pouze větev master/main a tagy v* (NE test-v*).
-# Testování updateru probíhá izolovaně ve větvi auto-update-testing
-# (workflow tauri-auto-update-test.yml, pre-release, endpoint updater-test).
+# Testování updateru: workflow tauri-auto-update-test.yml (tagy test-v*,
+# pre-release, endpoint updater-test), spuštění ručně přes workflow_dispatch.
 
 # Pozn.: GitHub Release se vytvoří až po pushi tagu v* (job release). Běžné pushy
 # na main/master nahrávají jen workflow artefakty do záložky Actions.

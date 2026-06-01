@@ -5,8 +5,6 @@ name: Tauri Auto-Update Test
 
 on:
   push:
-    branches:
-      - auto-update-testing
     tags:
       - "test-v*"
   workflow_dispatch:
@@ -141,7 +139,7 @@ jobs:
           |-----------|--------|
           | Windows | NSIS/MSI + \`GrommeR_portable.exe\` |
 
-          Po ověření updateru sloučit do \`master\` a vydat produkční tag \`v*\`."
+          Po ověření updateru vydat produkční tag \`v*\` z \`master\`."
           if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
             gh release upload "${{ github.ref_name }}" "${files[@]}" --clobber
             gh release edit "${{ github.ref_name }}" --prerelease --title "Grommet Marks ${{ github.ref_name }} (updater test)" --notes "$notes"

@@ -77,3 +77,12 @@ Thumbs.db
 # Výsledné ZIP (portable build)
 # ============================================================
 GrommetMarks-*.zip
+/GrommeR_portable.exe
+
+# ============================================================
+# Lokální testovací buildy updateru (CI artefakty)
+# ============================================================
+.tmp-artifacts/
+.tmp-artifacts-*/
+.tmp-release/
+.tmp-release-*/

@@ -968,18 +968,6 @@ export function GrommetForm() {
         )}
       </section>
 
-      {error && (
-        <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-800 dark:bg-red-900/30 dark:text-red-200">
-          {error}
-        </div>
-      )}
-
-      {successMsg && (
-        <div className="rounded-lg border border-green-200 bg-green-50 p-3 text-sm text-green-800 dark:border-green-800 dark:bg-green-900/30 dark:text-green-200">
-          ✓ {successMsg}
-        </div>
-      )}
-
       {/* Měřítko výkresu */}
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
         <h2 className="mb-2 text-lg font-semibold text-zinc-800 dark:text-zinc-100">
@@ -1520,6 +1508,18 @@ export function GrommetForm() {
             </div>
           </div>
         </section>
+      )}
+
+      {error && (
+        <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-800 dark:bg-red-900/30 dark:text-red-200">
+          {error}
+        </div>
+      )}
+
+      {successMsg && (
+        <div className="rounded-lg border border-green-200 bg-green-50 p-3 text-sm text-green-800 dark:border-green-800 dark:bg-green-900/30 dark:text-green-200">
+          ✓ {successMsg}
+        </div>
       )}
 
       <div className="flex justify-end gap-2">

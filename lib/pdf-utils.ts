@@ -49,23 +49,43 @@ export function extractErrorMessage(err: unknown, fallback: string): string {
 }
 
 /**
- * Vloží zdrojovou stránku do výstupního dokumentu.
+ * Vloží zdrojovou stránku do výstupního dokumentu OŘÍZNUTOU na TrimBox.
+ * BoundingBox = TrimBox zajistí, že do výstupu se dostane pouze čistý tiskový
+ * rozměr – ořezové značky (šnajtky), spadávka (bleed) a vše mimo TrimBox se
+ * oříznou. pdf-lib navíc posune obsah tak, aby spodní-levý roh TrimBoxu
+ * odpovídal (0,0), takže grafika sedí přesně na výstupní stránku bez posunu.
  * Některé PDF z DTP nástrojů nejdou přes embedPage – pak použijeme copyPages.
  */
+function getTrimBoundingBox(page: PDFPage): {
+  left: number;
+  bottom: number;
+  right: number;
+  top: number;
+} {
+  const trim = page.getTrimBox();
+  return {
+    left: trim.x,
+    bottom: trim.y,
+    right: trim.x + trim.width,
+    top: trim.y + trim.height,
+  };
+}
+
 async function embedSourcePageForDraw(
   outDoc: PDFDocument,
   srcDoc: PDFDocument,
   pageIndex: number
 ): Promise<PDFEmbeddedPage> {
   const srcPage = srcDoc.getPages()[pageIndex];
+  const boundingBox = getTrimBoundingBox(srcPage);
   try {
-    return await outDoc.embedPage(srcPage);
+    return await outDoc.embedPage(srcPage, boundingBox);
   } catch (embedErr) {
     try {
       const tempDoc = await PDFDocument.create();
       const [copied] = await tempDoc.copyPages(srcDoc, [pageIndex]);
       tempDoc.addPage(copied);
-      return await outDoc.embedPage(copied);
+      return await outDoc.embedPage(copied, getTrimBoundingBox(copied));
     } catch (copyErr) {
       const embedMsg = extractErrorMessage(embedErr, "");
       const copyMsg = extractErrorMessage(copyErr, "");

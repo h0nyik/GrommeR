@@ -25,6 +25,12 @@ export interface AppRuntimeInfo {
   isPortable: boolean;
 }
 
+/** Zavolá nativní Rust příkaz přes Tauri IPC. */
+async function invokeCore<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(cmd, args);
+}
+
 /**
  * Otevře externí URL v systémovém prohlížeči.
  * V Tauri používá opener plugin, ve webu běžné window.open.
@@ -70,7 +76,6 @@ function getDirnameFromPath(pathStr: string): string {
 }
 
 async function filesFromPaths(selectedPaths: string[]): Promise<OpenFilesResult> {
-  const { readFile } = await import("@tauri-apps/plugin-fs");
   const files: File[] = [];
   const filePaths: string[] = [];
   let defaultSaveDir = "";
@@ -79,7 +84,9 @@ async function filesFromPaths(selectedPaths: string[]): Promise<OpenFilesResult>
     if (!pathStr) continue;
     filePaths.push(pathStr);
     if (i === 0) defaultSaveDir = getDirnameFromPath(pathStr);
-    const bytes = await readFile(pathStr);
+    // Čtení přes nativní Rust příkaz – funguje i pro síťové/UNC cesty mimo fs scope.
+    const buffer = await invokeCore<ArrayBuffer>("read_file_bytes", { path: pathStr });
+    const bytes = new Uint8Array(buffer);
     const name = pathStr.replace(/^.*[\\/]/, "");
     files.push(new File([bytes], name, { type: getMimeTypeFromPath(pathStr) }));
   }
@@ -153,13 +160,12 @@ export async function saveBlobToFolder(
   overwriteStrategy: OverwriteStrategy = "overwrite"
 ): Promise<string | null> {
   if (!isTauri()) return null;
-  const { writeFile, exists } = await import("@tauri-apps/plugin-fs");
   const sep = outputFolder.includes("/") ? "/" : "\\";
   const normalizedFolder = outputFolder.replace(/[/\\]*$/, "");
   let targetPath = `${normalizedFolder}${sep}${suggestedName}`;
 
   if (overwriteStrategy !== "overwrite") {
-    const fileExists = await exists(targetPath);
+    const fileExists = await invokeCore<boolean>("file_exists", { path: targetPath });
     if (fileExists) {
       if (overwriteStrategy === "skip") return null;
       // suffix: přidej _1, _2, … před .pdf
@@ -168,7 +174,7 @@ export async function saveBlobToFolder(
       const ext = dotIdx >= 0 ? suggestedName.slice(dotIdx) : "";
       let n = 1;
       let candidate = `${normalizedFolder}${sep}${base}_${n}${ext}`;
-      while (await exists(candidate)) {
+      while (await invokeCore<boolean>("file_exists", { path: candidate })) {
         n++;
         candidate = `${normalizedFolder}${sep}${base}_${n}${ext}`;
       }
@@ -177,7 +183,8 @@ export async function saveBlobToFolder(
   }
 
   const buf = await blob.arrayBuffer();
-  await writeFile(targetPath, new Uint8Array(buf));
+  // Zápis přes nativní Rust příkaz – obchází fs scope, funguje i na síťové disky.
+  await invokeCore<void>("write_file_bytes", { path: targetPath, contents: new Uint8Array(buf) });
   return targetPath;
 }
 
@@ -193,7 +200,6 @@ export async function saveBlobViaTauri(
 ): Promise<boolean> {
   if (!isTauri()) return false;
   const { save } = await import("@tauri-apps/plugin-dialog");
-  const { writeFile } = await import("@tauri-apps/plugin-fs");
   const sep = (defaultDir ?? "").includes("/") ? "/" : "\\";
   const defaultPath =
     defaultDir && defaultDir.length > 0
@@ -205,7 +211,8 @@ export async function saveBlobViaTauri(
   });
   if (path == null) return false; // uživatel zrušil dialog – není to chyba
   const buf = await blob.arrayBuffer();
-  // Pokud writeFile selže, výjimka se propaguje nahoru (volající zobrací chybu)
-  await writeFile(path, new Uint8Array(buf));
+  // Zápis přes nativní Rust příkaz – obchází fs scope (síťové disky atd.).
+  // Pokud zápis selže, výjimka se propaguje nahoru (volající zobrazí chybu).
+  await invokeCore<void>("write_file_bytes", { path, contents: new Uint8Array(buf) });
   return true;
 }

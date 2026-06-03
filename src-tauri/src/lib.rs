@@ -29,6 +29,33 @@ fn get_app_runtime_info(app: tauri::AppHandle) -> AppRuntimeInfo {
   }
 }
 
+/// Zapíše bajty na libovolnou cestu přístupnou OS – obchází fs scope pluginu.
+/// Nutné pro ukládání na síťové/UNC disky a do složek mimo statický scope
+/// (Dokumenty, Plocha…), kam plugin-fs writeFile zapsat nesmí.
+#[tauri::command]
+fn write_file_bytes(path: String, contents: Vec<u8>) -> Result<(), String> {
+  if let Some(parent) = std::path::Path::new(&path).parent() {
+    if !parent.as_os_str().is_empty() {
+      std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all selhalo: {e}"))?;
+    }
+  }
+  std::fs::write(&path, &contents).map_err(|e| format!("write selhalo: {e}"))
+}
+
+/// Ověří existenci souboru na libovolné cestě (pro strategii přepisu/suffixu).
+#[tauri::command]
+fn file_exists(path: String) -> bool {
+  std::path::Path::new(&path).is_file()
+}
+
+/// Načte bajty z libovolné cesty přístupné OS – obchází fs scope pluginu.
+/// Vrací efektivní binární odpověď (ArrayBuffer na straně JS).
+#[tauri::command]
+fn read_file_bytes(path: String) -> Result<tauri::ipc::Response, String> {
+  let bytes = std::fs::read(&path).map_err(|e| format!("read selhalo: {e}"))?;
+  Ok(tauri::ipc::Response::new(bytes))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -47,7 +74,12 @@ pub fn run() {
       }
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_app_runtime_info])
+    .invoke_handler(tauri::generate_handler![
+      get_app_runtime_info,
+      write_file_bytes,
+      file_exists,
+      read_file_bytes
+    ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

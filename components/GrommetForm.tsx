@@ -8,10 +8,20 @@ import {
 } from "@/lib/image-to-pdf";
 import { generateOutputFilename } from "@/lib/output-filename";
 import {
+  getFileAcceptAttribute,
+  getInputFileKind,
+  isImageKind,
+  SUPPORTED_FORMATS_LABEL,
+} from "@/lib/input-formats";
+import { getPdfPageInfoLight } from "@/lib/pdf-metadata";
+import {
+  canUseNativePdfMarks,
+  NATIVE_PDF_MARKS_THRESHOLD_BYTES,
+  saveNativeMarksToFolder,
+} from "@/lib/pdf-native";
+import {
   addGrommetMarksToPdf,
   extractErrorMessage,
-  getPageInfo,
-  loadPdfDocument,
   normalizeDrawingScale,
 } from "@/lib/pdf-utils";
 import type {
@@ -22,12 +32,20 @@ import type {
 } from "@/types/grommet";
 import { track } from "@/lib/analytics";
 import {
+  assertAllocatableByteLength,
+  bytesToBlobPart,
+  readInputFileBytes,
+} from "@/lib/input-bytes";
+import {
   chooseOutputFolderViaTauri,
   isTauri,
   openDroppedPathsViaTauri,
   openFilesViaTauri,
-  saveBlobToFolder,
-  saveBlobViaTauri,
+  readFileBytesFromPath,
+  saveBytesToFolder,
+  saveBytesViaTauri,
+  type ImportProgress,
+  type OpenFilesResult,
   type OverwriteStrategy,
 } from "@/lib/tauri-bridge";
 import { ImagePreview } from "./ImagePreview";
@@ -62,7 +80,9 @@ interface BatchItem {
   id: string;
   file: File;
   sourceDir: string | null;
-  bytes: ArrayBuffer | null;
+  /** Plná cesta ke zdroji v Tauri – u velkých PDF se bajty v paměti neudržují. */
+  sourcePath: string | null;
+  bytes: Uint8Array | null;
   pageInfo: PdfPageInfo | null;
   status: BatchStatus;
   error: string | null;
@@ -72,6 +92,9 @@ interface BatchItem {
 interface SelectedInputFile {
   file: File;
   sourceDir: string | null;
+  sourcePath?: string | null;
+  /** Přednačtené bajty z Tauri importu – bez opakovaného file.arrayBuffer(). */
+  bytes?: Uint8Array;
 }
 
 interface ExportSettings {
@@ -85,14 +108,6 @@ function getDirnameFromPath(path: string | null | undefined): string | null {
   const idx = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   if (idx < 0) return null;
   return path.slice(0, idx);
-}
-
-function getInputFileKind(file: File): "pdf" | "image/jpeg" | "image/png" | null {
-  const name = file.name.toLowerCase();
-  if (file.type === "application/pdf" || name.endsWith(".pdf")) return "pdf";
-  if (file.type === "image/png" || name.endsWith(".png")) return "image/png";
-  if (file.type === "image/jpeg" || name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
-  return null;
 }
 
 function clamp(min: number, max: number, value: number): number {
@@ -233,7 +248,8 @@ function downloadBlobInBrowser(blob: Blob, filename: string): void {
 export function GrommetForm() {
   const [file, setFile] = useState<File | null>(null);
   const [sourceDir, setSourceDir] = useState<string | null>(null);
-  const [fileBytes, setFileBytes] = useState<ArrayBuffer | null>(null);
+  const [sourcePath, setSourcePath] = useState<string | null>(null);
+  const [fileBytes, setFileBytes] = useState<Uint8Array | null>(null);
   const [pageInfo, setPageInfo] = useState<PdfPageInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [processing, setProcessing] = useState(false);
@@ -270,6 +286,14 @@ export function GrommetForm() {
   const [isDragOver, setIsDragOver] = useState(false);
   // Tauri detekce přes useEffect – řeší race condition při prvním renderu
   const [isInTauri, setIsInTauri] = useState(false);
+  // Průběh importu souborů: "reading" = čtení ze zdroje (pomalé u velkých grafik
+  // ze sítě), "parsing" = analýza rozměrů/PDF. null = import neprobíhá.
+  const [importStatus, setImportStatus] = useState<{
+    phase: "reading" | "parsing";
+    current: number;
+    total: number;
+    fileName?: string;
+  } | null>(null);
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -340,29 +364,41 @@ export function GrommetForm() {
         };
 
   const loadOneBatchItem = useCallback(
-    async (item: BatchItem): Promise<BatchItem> => {
+    async (
+      item: BatchItem,
+      cachedBytes?: Uint8Array,
+      sourcePath?: string | null
+    ): Promise<BatchItem> => {
       const fileKind = getInputFileKind(item.file);
       try {
-        const bytes = await item.file.arrayBuffer();
+        const bytes = await readInputFileBytes(item.file, cachedBytes);
         let info: PdfPageInfo | null = null;
         if (fileKind === "pdf") {
-          const doc = await loadPdfDocument(bytes);
-          const pages = doc.getPages();
-          if (pages.length === 0) return { ...item, bytes, status: "error", error: "Žádná stránka." };
-          info = getPageInfo(pages[0], 0);
+          info = await getPdfPageInfoLight(bytes);
         } else if (fileKind) {
           const dim = await getImageDimensionsMm(bytes, fileKind);
           info = createPageInfoFromDimensionsMm(dim.widthMm, dim.heightMm);
         } else {
           return { ...item, bytes, status: "error", error: "Nepodporovaný typ souboru." };
         }
-        return { ...item, bytes, pageInfo: info, status: "ready", error: null };
+        const canDropBytes =
+          !!sourcePath &&
+          fileKind === "pdf" &&
+          item.file.size >= NATIVE_PDF_MARKS_THRESHOLD_BYTES;
+        return {
+          ...item,
+          sourcePath: sourcePath ?? null,
+          bytes: canDropBytes ? null : bytes,
+          pageInfo: info,
+          status: "ready",
+          error: null,
+        };
       } catch (err) {
         return {
           ...item,
           bytes: null,
           status: "error",
-          error: extractErrorMessage(err, "Chyba načtení."),
+          error: extractErrorMessage(err, "Chyba načtení.", item.file.size),
         };
       }
     },
@@ -377,70 +413,92 @@ export function GrommetForm() {
       setFileBytes(null);
       setFile(null);
       setSourceDir(null);
+      setSourcePath(null);
       setBatchItems([]);
 
-      if (files.length === 0) return;
+      if (files.length === 0) {
+        setImportStatus(null);
+        return;
+      }
       if (files.length > MAX_BATCH_FILES) {
         setError(`Maximálně ${MAX_BATCH_FILES} souborů.`);
+        setImportStatus(null);
         return;
       }
 
       const valid = files.every((f) => getInputFileKind(f) !== null);
       if (!valid) {
-        setError("Pouze PDF nebo obrázky (JPG, PNG).");
+        setError(`Pouze ${SUPPORTED_FORMATS_LABEL}.`);
+        setImportStatus(null);
         return;
       }
 
-      if (files.length === 1) {
-        const entry = selectedFiles[0];
-        const f = entry.file;
-        setFile(f);
-        setSourceDir(entry.sourceDir);
-        if (saveToSourceFolder && entry.sourceDir) {
-          setOutputFolder(entry.sourceDir);
-          setDefaultSaveDir(entry.sourceDir);
-        }
-        try {
-          const bytes = await f.arrayBuffer();
-          setFileBytes(bytes);
-          const fileKind = getInputFileKind(f);
-          if (fileKind === "pdf") {
-            const doc = await loadPdfDocument(bytes);
-            const pages = doc.getPages();
-            if (pages.length === 0) {
-              setError("PDF neobsahuje žádnou stránku.");
-              return;
-            }
-            setPageInfo(getPageInfo(pages[0], 0));
-          } else if (fileKind) {
-            const dim = await getImageDimensionsMm(bytes, fileKind);
-            setPageInfo(createPageInfoFromDimensionsMm(dim.widthMm, dim.heightMm));
+      // Fáze analýzy (rozměry / PDF). U dávky ji ukazujeme i přes stavy položek.
+      setImportStatus({ phase: "parsing", current: 0, total: files.length });
+      try {
+        if (files.length === 1) {
+          const entry = selectedFiles[0];
+          const f = entry.file;
+          setFile(f);
+          setSourceDir(entry.sourceDir);
+          setSourcePath(entry.sourcePath ?? null);
+          if (saveToSourceFolder && entry.sourceDir) {
+            setOutputFolder(entry.sourceDir);
+            setDefaultSaveDir(entry.sourceDir);
           }
-        } catch (err) {
-          setError(extractErrorMessage(err, "Nepodařilo se načíst soubor."));
+          try {
+            const bytes = await readInputFileBytes(f, entry.bytes);
+            const fileKind = getInputFileKind(f);
+            if (fileKind === "pdf") {
+              setPageInfo(await getPdfPageInfoLight(bytes));
+            } else if (fileKind) {
+              const dim = await getImageDimensionsMm(bytes, fileKind);
+              setPageInfo(createPageInfoFromDimensionsMm(dim.widthMm, dim.heightMm));
+            }
+            const canDropBytes =
+              !!entry.sourcePath &&
+              fileKind === "pdf" &&
+              f.size >= NATIVE_PDF_MARKS_THRESHOLD_BYTES;
+            setFileBytes(canDropBytes ? null : bytes);
+          } catch (err) {
+            setError(extractErrorMessage(err, "Nepodařilo se načíst soubor.", f.size));
+          }
+          return;
         }
-        return;
-      }
 
-      const items: BatchItem[] = files.map((file, i) => ({
-        id: `${file.name}-${i}-${Date.now()}`,
-        file,
-        sourceDir: selectedFiles[i]?.sourceDir ?? null,
-        bytes: null,
-        pageInfo: null,
-        status: "loading" as BatchStatus,
-        error: null,
-        outputNameOverride: "",
-      }));
-      setBatchItems(items);
-      const loaded = await Promise.all(items.map(loadOneBatchItem));
-      setBatchItems(loaded);
+        const items: BatchItem[] = files.map((file, i) => ({
+          id: `${file.name}-${i}-${Date.now()}`,
+          file,
+          sourceDir: selectedFiles[i]?.sourceDir ?? null,
+          sourcePath: selectedFiles[i]?.sourcePath ?? null,
+          bytes: null,
+          pageInfo: null,
+          status: "loading" as BatchStatus,
+          error: null,
+          outputNameOverride: "",
+        }));
+        setBatchItems(items);
+        const loaded: BatchItem[] = [];
+        for (let i = 0; i < items.length; i++) {
+          setImportStatus({ phase: "parsing", current: i + 1, total: items.length });
+          const result = await loadOneBatchItem(
+            items[i],
+            selectedFiles[i]?.bytes,
+            selectedFiles[i]?.sourcePath
+          );
+          loaded.push(result);
+          setBatchItems([...loaded, ...items.slice(i + 1)]);
+        }
+        setBatchItems(loaded);
+      } finally {
+        setImportStatus(null);
+      }
     },
     [loadOneBatchItem, saveToSourceFolder]
   );
 
   const applyOpenFilesResult = useCallback(
-    (result: { files: File[]; paths: string[]; defaultSaveDir: string }) => {
+    (result: OpenFilesResult) => {
       if (!result.files.length) return;
       if (result.defaultSaveDir) {
         setDefaultSaveDir(result.defaultSaveDir);
@@ -454,6 +512,8 @@ export function GrommetForm() {
         result.files.map((file, idx) => ({
           file,
           sourceDir: getDirnameFromPath(result.paths[idx] ?? null),
+          sourcePath: result.paths[idx] ?? null,
+          bytes: result.preloadedBytes[idx],
         }))
       );
     },
@@ -469,13 +529,29 @@ export function GrommetForm() {
     [applySelectedFiles]
   );
 
-  const handleTauriOpenFiles = useCallback(async () => {
-    const result = await openFilesViaTauri({
-      multiple: true,
-      accept: "application/pdf,image/jpeg,image/png",
+  const reportImportRead = useCallback((p: ImportProgress) => {
+    setImportStatus({
+      phase: "reading",
+      current: p.current,
+      total: p.total,
+      fileName: p.fileName,
     });
-    if (result?.files.length) applyOpenFilesResult(result);
-  }, [applyOpenFilesResult]);
+  }, []);
+
+  const handleTauriOpenFiles = useCallback(async () => {
+    const result = await openFilesViaTauri(
+      {
+        multiple: true,
+        accept: getFileAcceptAttribute(),
+      },
+      reportImportRead
+    );
+    if (result?.files.length) {
+      applyOpenFilesResult(result);
+    } else {
+      setImportStatus(null);
+    }
+  }, [applyOpenFilesResult, reportImportRead]);
 
   const handleDropOnTauri = useCallback(
     (e: React.DragEvent<HTMLDivElement>) => {
@@ -520,8 +596,12 @@ export function GrommetForm() {
             return;
           }
           setIsDragOver(false);
-          const result = await openDroppedPathsViaTauri(payload.paths ?? []);
-          if (result?.files.length) applyOpenFilesResult(result);
+          const result = await openDroppedPathsViaTauri(payload.paths ?? [], reportImportRead);
+          if (result?.files.length) {
+            applyOpenFilesResult(result);
+          } else {
+            setImportStatus(null);
+          }
         })
       )
       .then((fn) => {
@@ -535,7 +615,7 @@ export function GrommetForm() {
       cancelled = true;
       unlisten?.();
     };
-  }, [applyOpenFilesResult, isInTauri, processing]);
+  }, [applyOpenFilesResult, isInTauri, processing, reportImportRead]);
 
   const handleChooseOutputFolder = useCallback(async () => {
     const folder = await chooseOutputFolderViaTauri();
@@ -601,7 +681,9 @@ export function GrommetForm() {
   }, [batchItems, drawingScale, pageInfo, targetUnit]);
 
   const handleBatchSubmit = async () => {
-    const ready = batchItems.filter((i) => i.status === "ready" && i.bytes && i.pageInfo);
+    const ready = batchItems.filter(
+      (i) => i.status === "ready" && i.pageInfo && (i.bytes || i.sourcePath)
+    );
     if (ready.length === 0) return;
     if (outputSizeMode === "target" && !targetSizeMm) {
       setError("Zadejte kladnou šířku i výšku cílového plátna.");
@@ -617,19 +699,12 @@ export function GrommetForm() {
 
     for (let idx = 0; idx < ready.length; idx++) {
       const item = ready[idx];
-      if (!item.bytes || !item.pageInfo) continue;
+      if (!item.pageInfo) continue;
       setBatchItems((prev) =>
         prev.map((i) => (i.id === item.id ? { ...i, status: "processing" as BatchStatus } : i))
       );
       try {
-        let pdfBytes: ArrayBuffer | Uint8Array = item.bytes;
         const fileKind = getInputFileKind(item.file);
-        if (fileKind && fileKind !== "pdf") {
-          pdfBytes = await createPdfFromImage(
-            item.bytes,
-            fileKind
-          );
-        }
         const outputSize = getOutputSizeMm(item.pageInfo);
         const params: GrommetMarksParams = {
           widthMm: outputSize.widthMm,
@@ -641,12 +716,11 @@ export function GrommetForm() {
           countPerEdge: mode === "count" ? countPerEdge : undefined,
           spacingMm: mode === "spacing" ? spacing * 10 : undefined,
         };
-        const result = await addGrommetMarksToPdf(
-          pdfBytes,
-          params,
-          { shape, sizeMm: size, borderColor: getMarkColor() },
-          { drawingScale, targetSizeMm: targetSizeMm ?? undefined }
-        );
+        const drawOptions = {
+          shape,
+          sizeMm: size,
+          borderColor: getMarkColor(),
+        } as const;
         const outputName =
           item.outputNameOverride.trim() ||
           generateOutputFilename({
@@ -655,32 +729,86 @@ export function GrommetForm() {
             heightMm: outputSize.heightMm,
             ...getSpacingForFilename(item.pageInfo),
           });
-        const ab = new ArrayBuffer(result.byteLength);
-        new Uint8Array(ab).set(result);
-        const blob = new Blob([ab], { type: "application/pdf" });
         let skipped = false;
-        if (isInTauri) {
+        const useNative = canUseNativePdfMarks({
+          sourcePath: item.sourcePath,
+          fileKind,
+          fileSize: item.file.size,
+          drawingScale,
+          hasTargetSize: !!targetSizeMm,
+        });
+
+        if (useNative && item.sourcePath) {
           const folder =
             (saveToSourceFolder ? item.sourceDir : null) ?? outputFolder ?? defaultSaveDir;
-          if (folder) {
-            rememberOutputFolder(folder);
-            const savedPath = await saveBlobToFolder(blob, folder, outputName, overwriteStrategy);
-            if (savedPath === null) {
-              if (overwriteStrategy === "skip") {
-                skipped = true;
-              } else {
-                throw new Error(`Nepodařilo se uložit soubor do složky: ${folder}`);
+          if (!folder) {
+            throw new Error(
+              "U velkých PDF vyberte výstupní složku – dialog pro každý soubor není u nativní cesty podporován."
+            );
+          }
+          rememberOutputFolder(folder);
+          const savedPath = await saveNativeMarksToFolder(
+            item.sourcePath,
+            folder,
+            outputName,
+            params,
+            item.pageInfo,
+            drawOptions,
+            overwriteStrategy
+          );
+          if (savedPath === null) {
+            if (overwriteStrategy === "skip") skipped = true;
+            else throw new Error(`Nepodařilo se uložit soubor do složky: ${folder}`);
+          }
+        } else {
+          let inputBytes = item.bytes;
+          if (!inputBytes) {
+            if (item.sourcePath) {
+              inputBytes = await readFileBytesFromPath(item.sourcePath);
+            } else {
+              inputBytes = await readInputFileBytes(item.file);
+            }
+          }
+          let pdfBytes: ArrayBuffer | Uint8Array = inputBytes;
+          if (fileKind && fileKind !== "pdf") {
+            pdfBytes = await createPdfFromImage(inputBytes, fileKind);
+          }
+          const result = await addGrommetMarksToPdf(
+            pdfBytes,
+            params,
+            drawOptions,
+            { drawingScale, targetSizeMm: targetSizeMm ?? undefined }
+          );
+          assertAllocatableByteLength(result.byteLength, "Výstupní PDF");
+          if (isInTauri) {
+            const folder =
+              (saveToSourceFolder ? item.sourceDir : null) ?? outputFolder ?? defaultSaveDir;
+            if (folder) {
+              rememberOutputFolder(folder);
+              const savedPath = await saveBytesToFolder(
+                result,
+                folder,
+                outputName,
+                overwriteStrategy
+              );
+              if (savedPath === null) {
+                if (overwriteStrategy === "skip") skipped = true;
+                else throw new Error(`Nepodařilo se uložit soubor do složky: ${folder}`);
+              }
+            } else {
+              const dialSaved = await saveBytesViaTauri(result, outputName, null);
+              if (!dialSaved) {
+                throw new Error(
+                  "Uložení bylo zrušeno nebo selhalo. Vyberte výstupní složku v sekci níže."
+                );
               }
             }
           } else {
-            // Žádná složka není vybrána – otevřeme dialog pro každý soubor
-            const dialSaved = await saveBlobViaTauri(blob, outputName, null);
-            if (!dialSaved) {
-              throw new Error("Uložení bylo zrušeno nebo selhalo. Vyberte výstupní složku v sekci níže.");
-            }
+            downloadBlobInBrowser(
+              new Blob([bytesToBlobPart(result)], { type: "application/pdf" }),
+              outputName
+            );
           }
-        } else {
-          downloadBlobInBrowser(blob, outputName);
         }
         setBatchItems((prev) =>
           prev.map((i) =>
@@ -692,7 +820,7 @@ export function GrommetForm() {
         if (skipped) batchSkippedCount++;
         else batchSuccessCount++;
       } catch (err) {
-        const msg = extractErrorMessage(err, "Chyba při generování PDF.");
+        const msg = extractErrorMessage(err, "Chyba při generování PDF.", item.file.size);
         track({ type: "error", message: msg, context: "batch" });
         setBatchItems((prev) =>
           prev.map((i) =>
@@ -717,7 +845,7 @@ export function GrommetForm() {
       handleBatchSubmit();
       return;
     }
-    if (!fileBytes || !pageInfo || !file) {
+    if ((!fileBytes && !sourcePath) || !pageInfo || !file) {
       setError("Nejprve nahrajte PDF nebo obrázek.");
       return;
     }
@@ -729,14 +857,7 @@ export function GrommetForm() {
     setSuccessMsg(null);
     setProcessing(true);
     try {
-      let pdfBytes: ArrayBuffer | Uint8Array = fileBytes;
       const fileKind = getInputFileKind(file);
-      if (fileKind && fileKind !== "pdf") {
-        pdfBytes = await createPdfFromImage(
-          fileBytes,
-          fileKind
-        );
-      }
       const outputSize = getOutputSizeMm(pageInfo);
       const params: GrommetMarksParams = {
         widthMm: outputSize.widthMm,
@@ -748,61 +869,107 @@ export function GrommetForm() {
         countPerEdge: mode === "count" ? countPerEdge : undefined,
         spacingMm: mode === "spacing" ? spacing * 10 : undefined,
       };
-      const result = await addGrommetMarksToPdf(
-        pdfBytes,
-        params,
-        {
-          shape,
-          sizeMm: size,
-          borderColor: getMarkColor(),
-        },
-        { drawingScale, targetSizeMm: targetSizeMm ?? undefined }
-      );
-      const wEff = outputSize.widthMm;
-      const hEff = outputSize.heightMm;
-
+      const drawOptions = {
+        shape,
+        sizeMm: size,
+        borderColor: getMarkColor(),
+      } as const;
       const outputName = generateOutputFilename({
         originalFileName: file?.name ?? "vystup.pdf",
-        widthMm: wEff,
-        heightMm: hEff,
+        widthMm: outputSize.widthMm,
+        heightMm: outputSize.heightMm,
         ...getSpacingForFilename(pageInfo),
       });
+      const useNative = canUseNativePdfMarks({
+        sourcePath,
+        fileKind,
+        fileSize: file.size,
+        drawingScale,
+        hasTargetSize: !!targetSizeMm,
+      });
 
-      if (!result || result.byteLength < 50) {
-        throw new Error("Vygenerované PDF je prázdné nebo poškozené. Zkuste jiný soubor.");
-      }
-
-      const ab = new ArrayBuffer(result.byteLength);
-      new Uint8Array(ab).set(result);
-      const blob = new Blob([ab], { type: "application/pdf" });
-
-      if (isInTauri) {
+      if (useNative && sourcePath) {
         const folder = (saveToSourceFolder ? sourceDir : null) ?? outputFolder ?? defaultSaveDir;
-        if (folder) {
-          rememberOutputFolder(folder);
-          const savedPath = await saveBlobToFolder(blob, folder, outputName, overwriteStrategy);
-          if (savedPath === null) {
-            if (overwriteStrategy === "skip") {
-              showSuccess(`Soubor přeskočen, protože už existuje: ${outputName}`);
-              return;
-            }
-            throw new Error(`Nepodařilo se uložit soubor do složky: ${folder}`);
-          }
-          showSuccess(`Soubor uložen: ${savedPath}`);
-        } else {
-          const dialSaved = await saveBlobViaTauri(blob, outputName, null);
-          if (!dialSaved) {
-            throw new Error("Uložení bylo zrušeno nebo selhalo. Vyberte výstupní složku nebo zkuste znovu.");
-          }
-          showSuccess(`Soubor uložen: ${outputName}`);
+        if (!folder) {
+          throw new Error("U velkých PDF vyberte výstupní složku před generováním.");
         }
+        rememberOutputFolder(folder);
+        const savedPath = await saveNativeMarksToFolder(
+          sourcePath,
+          folder,
+          outputName,
+          params,
+          pageInfo,
+          drawOptions,
+          overwriteStrategy
+        );
+        if (savedPath === null) {
+          if (overwriteStrategy === "skip") {
+            showSuccess(`Soubor přeskočen, protože už existuje: ${outputName}`);
+            return;
+          }
+          throw new Error(`Nepodařilo se uložit soubor do složky: ${folder}`);
+        }
+        showSuccess(`Soubor uložen: ${savedPath}`);
       } else {
-        downloadBlobInBrowser(blob, outputName);
-        showSuccess(`Soubor stažen: ${outputName}`);
+        let inputBytes = fileBytes;
+        if (!inputBytes) {
+          if (sourcePath) inputBytes = await readFileBytesFromPath(sourcePath);
+          else inputBytes = await readInputFileBytes(file);
+        }
+        let pdfBytes: ArrayBuffer | Uint8Array = inputBytes;
+        if (fileKind && fileKind !== "pdf") {
+          pdfBytes = await createPdfFromImage(inputBytes, fileKind);
+        }
+        const result = await addGrommetMarksToPdf(
+          pdfBytes,
+          params,
+          drawOptions,
+          { drawingScale, targetSizeMm: targetSizeMm ?? undefined }
+        );
+        if (!result || result.byteLength < 50) {
+          throw new Error("Vygenerované PDF je prázdné nebo poškozené. Zkuste jiný soubor.");
+        }
+        assertAllocatableByteLength(result.byteLength, "Výstupní PDF");
+
+        if (isInTauri) {
+          const folder = (saveToSourceFolder ? sourceDir : null) ?? outputFolder ?? defaultSaveDir;
+          if (folder) {
+            rememberOutputFolder(folder);
+            const savedPath = await saveBytesToFolder(
+              result,
+              folder,
+              outputName,
+              overwriteStrategy
+            );
+            if (savedPath === null) {
+              if (overwriteStrategy === "skip") {
+                showSuccess(`Soubor přeskočen, protože už existuje: ${outputName}`);
+                return;
+              }
+              throw new Error(`Nepodařilo se uložit soubor do složky: ${folder}`);
+            }
+            showSuccess(`Soubor uložen: ${savedPath}`);
+          } else {
+            const dialSaved = await saveBytesViaTauri(result, outputName, null);
+            if (!dialSaved) {
+              throw new Error(
+                "Uložení bylo zrušeno nebo selhalo. Vyberte výstupní složku nebo zkuste znovu."
+              );
+            }
+            showSuccess(`Soubor uložen: ${outputName}`);
+          }
+        } else {
+          downloadBlobInBrowser(
+            new Blob([bytesToBlobPart(result)], { type: "application/pdf" }),
+            outputName
+          );
+          showSuccess(`Soubor stažen: ${outputName}`);
+        }
       }
       track({ type: "pdf_generated", single: true });
     } catch (err) {
-      const msg = extractErrorMessage(err, "Chyba při generování PDF.");
+      const msg = extractErrorMessage(err, "Chyba při generování PDF.", file?.size);
       track({ type: "error", message: msg, context: "single" });
       setError(msg);
     } finally {
@@ -818,7 +985,7 @@ export function GrommetForm() {
           Nahrání souborů
         </h2>
         <p className="mb-2 text-sm text-zinc-500 dark:text-zinc-400">
-          Jeden soubor nebo dávka (až {MAX_BATCH_FILES}× PDF / JPG / PNG).
+          Jeden soubor nebo dávka (až {MAX_BATCH_FILES}× {SUPPORTED_FORMATS_LABEL}).
         </p>
         <div
           onDragOver={(e) => {
@@ -849,17 +1016,18 @@ export function GrommetForm() {
         >
           {isInTauri && (
             <p className="mb-2 text-sm text-zinc-600 dark:text-zinc-400">
-              Drag&drop z Průzkumníka je podporován: přetáhněte PDF/JPG/PNG sem.
+              Drag&drop z Průzkumníka je podporován: přetáhněte {SUPPORTED_FORMATS_LABEL} sem.
             </p>
           )}
           <div className="flex flex-wrap items-center gap-2">
           {!isInTauri && (
             <input
               type="file"
-              accept="application/pdf,image/jpeg,image/png"
+              accept={getFileAcceptAttribute()}
               multiple
+              disabled={importStatus !== null}
               onChange={onFileChange}
-              className="block flex-1 min-w-0 text-sm text-zinc-600 file:mr-4 file:rounded file:border-0 file:bg-zinc-200 file:px-4 file:py-2 file:text-sm file:font-medium dark:text-zinc-400 file:dark:bg-zinc-700"
+              className="block flex-1 min-w-0 text-sm text-zinc-600 file:mr-4 file:rounded file:border-0 file:bg-zinc-200 file:px-4 file:py-2 file:text-sm file:font-medium disabled:cursor-not-allowed disabled:opacity-60 dark:text-zinc-400 file:dark:bg-zinc-700"
             />
           )}
           {isInTauri && (
@@ -870,14 +1038,54 @@ export function GrommetForm() {
               <button
                 type="button"
                 onClick={handleTauriOpenFiles}
-                className="rounded border border-zinc-300 bg-zinc-100 px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-200 dark:border-zinc-600 dark:bg-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-600"
+                disabled={importStatus !== null}
+                className="rounded border border-zinc-300 bg-zinc-100 px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-60 dark:border-zinc-600 dark:bg-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-600"
               >
-                Vybrat soubory (systémový dialog)
+                {importStatus ? "Importuji…" : "Vybrat soubory (systémový dialog)"}
               </button>
             </>
           )}
           </div>
         </div>
+        {importStatus && (
+          <div
+            className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-500/30 dark:bg-amber-500/10"
+            role="status"
+            aria-live="polite"
+          >
+            <div className="flex items-center gap-2 text-sm font-medium text-amber-800 dark:text-amber-200">
+              <svg
+                className="h-4 w-4 animate-spin text-amber-600 dark:text-amber-300"
+                viewBox="0 0 24 24"
+                fill="none"
+                aria-hidden
+              >
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+              <span>
+                {importStatus.phase === "reading"
+                  ? `Importuji soubory ze zdroje… ${importStatus.current}/${importStatus.total}${
+                      importStatus.fileName ? ` – ${importStatus.fileName}` : ""
+                    }`
+                  : "Zpracovávám soubory…"}
+              </span>
+            </div>
+            <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-amber-200/60 dark:bg-amber-500/20">
+              {importStatus.phase === "reading" && importStatus.total > 0 ? (
+                <div
+                  className="h-full rounded-full bg-amber-500 transition-all"
+                  style={{ width: `${Math.round((importStatus.current / importStatus.total) * 100)}%` }}
+                />
+              ) : (
+                <div className="h-full w-full animate-pulse rounded-full bg-amber-400" />
+              )}
+            </div>
+            <p className="mt-1 text-xs text-amber-700/80 dark:text-amber-300/70">
+              U velkých grafik ze síťového úložiště může načítání chvíli trvat. Aplikace pracuje, vyčkejte prosím.
+            </p>
+          </div>
+        )}
         {file && !batchItems.length && (
           <>
             <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
@@ -898,11 +1106,18 @@ export function GrommetForm() {
                       {(pageInfo.heightMm * drawingScale).toFixed(1)} mm při 1:{drawingScale}
                     </>
                   )}
-                  {getInputFileKind(file)?.startsWith("image/") && " (obrázek → výstup PDF)"}
+                  {isImageKind(getInputFileKind(file)!) && " (obrázek → výstup PDF)"}
                 </>
               )}
             </p>
-            <ImagePreview file={getInputFileKind(file)?.startsWith("image/") ? file : null} />
+            <ImagePreview
+              file={
+                (() => {
+                  const kind = getInputFileKind(file);
+                  return kind && isImageKind(kind) ? file : null;
+                })()
+              }
+            />
             <PdfPreview file={getInputFileKind(file) === "pdf" ? file : null} />
           </>
         )}
@@ -1528,7 +1743,7 @@ export function GrommetForm() {
           title={
             processing
               ? undefined
-              : batchItems.length === 0 && (!fileBytes || !pageInfo)
+              : batchItems.length === 0 && ((!fileBytes && !sourcePath) || !pageInfo)
                 ? "Nejprve nahrajte PDF nebo obrázek (použijte tlačítko „Vybrat soubory“)"
                 : batchItems.length > 0 && !batchItems.some((i) => i.status === "ready")
                   ? "Počkejte na načtení souborů"
@@ -1536,7 +1751,7 @@ export function GrommetForm() {
           }
           disabled={
             processing ||
-            (batchItems.length === 0 && (!fileBytes || !pageInfo)) ||
+            (batchItems.length === 0 && ((!fileBytes && !sourcePath) || !pageInfo)) ||
             (batchItems.length > 0 && !batchItems.some((i) => i.status === "ready"))
           }
           className="rounded-lg bg-zinc-800 px-6 py-2.5 font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"

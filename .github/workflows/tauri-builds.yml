@@ -113,6 +113,7 @@ jobs:
             GrommeR_portable.exe
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/nsis/*.exe.sig
+            src-tauri/target/release/bundle/nsis/*.zip
             src-tauri/target/release/bundle/msi/*.msi
             src-tauri/target/release/bundle/msi/*.msi.sig
           if-no-files-found: warn
@@ -123,7 +124,8 @@ jobs:
         with:
           name: tauri-${{ matrix.name }}
           path: |
-            src-tauri/target/release/bundle/**
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.sig
           if-no-files-found: warn
 
       - name: Upload artefaktů (macOS)
@@ -158,24 +160,32 @@ jobs:
         continue-on-error: true
         run: node scripts/create-tauri-latest-json.cjs artifacts "${{ github.ref_name }}" "https://github.com/h0nyik/GrommeR"
 
+      - name: Sestavit minimální sadu souborů pro Release
+        run: node scripts/prepare-release-assets.cjs artifacts release-upload latest.json production
+
+      - name: Připravit popis release
+        run: |
+          NOTES_FILE="release-notes/${{ github.ref_name }}.md"
+          FOOTER=$'---\n\n## Stažení\n\n| Platforma | Soubory |\n|-----------|--------|\n| Windows | NSIS instalátor, MSI (volitelně), `GrommeR_portable.exe` |\n| Linux | AppImage (pokud build proběhl) |\n| macOS Apple Silicon | DMG (instalace); `*.app.tar.gz` jen pro automatickou aktualizaci |\n\n`latest.json` – manifest pro auto-update (není nutné stahovat ručně).\n\nRepozitář: [h0nyik/GrommeR](https://github.com/h0nyik/GrommeR)'
+          if [ -f "$NOTES_FILE" ]; then
+            { cat "$NOTES_FILE"; echo ""; echo "$FOOTER"; } > /tmp/release-body.md
+          else
+            {
+              echo "## ⚠️ Chybí release poznámky"
+              echo ""
+              echo "Před dalším tagem doplňte \`release-notes/${{ github.ref_name }}.md\` (viz \`release-notes/TEMPLATE.md\`) – stručný přehled změn oproti předchozí verzi."
+              echo ""
+              echo "$FOOTER"
+            } > /tmp/release-body.md
+          fi
+
       - name: Vytvořit release a nahrát soubory
         uses: softprops/action-gh-release@v2
         with:
           name: Grommet Marks ${{ github.ref_name }}
-          body: |
-            Automatický build z GitHub Actions.
-
-            | Platforma | Zdroj |
-            |-----------|--------|
-            | Windows | NSIS/MSI + `GrommeR_portable.exe` (portable, bez instalace) v `tauri-Windows x64` |
-            | Linux | `tauri-Linux x64` |
-            | macOS Apple Silicon | DMG (`*.dmg`) v `tauri-macos Apple Silicon` – přetáhnout aplikaci do „Aplikace“ |
-
-            Soubor `latest.json` slouží instalovaným desktopovým verzím pro automatickou kontrolu aktualizací.
-
-            Repozitář: [h0nyik/GrommeR](https://github.com/h0nyik/GrommeR)
-          files: artifacts/**
+          body_path: /tmp/release-body.md
+          files: release-upload/**
           fail_on_unmatched_files: false
-          generate_release_notes: true
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

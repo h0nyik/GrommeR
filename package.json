@@ -1,6 +1,6 @@
 {
   "name": "grommet-marks-app",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -24,7 +24,9 @@
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^5.4.624",
     "react": "19.2.3",
-    "react-dom": "19.2.3"
+    "react-dom": "19.2.3",
+    "upng-js": "^2.1.0",
+    "utif": "^3.1.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

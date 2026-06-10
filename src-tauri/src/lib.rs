@@ -1,3 +1,5 @@
+mod pdf_marks;
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppRuntimeInfo {
@@ -78,7 +80,8 @@ pub fn run() {
       get_app_runtime_info,
       write_file_bytes,
       file_exists,
-      read_file_bytes
+      read_file_bytes,
+      pdf_marks::add_grommet_marks_native
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

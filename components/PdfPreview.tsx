@@ -1,5 +1,6 @@
 "use client";
 
+import { formatBytesCs, shouldLoadPdfPreview } from "@/lib/input-bytes";
 import { useEffect, useRef, useState } from "react";
 
 const MAX_PREVIEW_PX = 400;
@@ -22,6 +23,12 @@ export function PdfPreview({ file, maxSize = MAX_PREVIEW_PX }: PdfPreviewProps) 
     const isPdf = file?.type === "application/pdf" || file?.name.toLowerCase().endsWith(".pdf");
     if (!file || !isPdf) {
       setError(null);
+      return;
+    }
+    if (!shouldLoadPdfPreview(file)) {
+      setError(
+        `Náhled není k dispozici u velmi velkých PDF (${formatBytesCs(file.size)}). Rozměry stránky se načtou z metadat.`
+      );
       return;
     }
     setError(null);

@@ -105,41 +105,34 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
-      - name: Srovnat stažené artefakty do kořene artifacts/
-        shell: bash
-        run: |
-          set -euo pipefail
-          find artifacts -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.sig' \) -exec cp -f {} artifacts/ \;
-          if [ -f artifacts/GrommeR_portable.exe ]; then
-            cp -f artifacts/GrommeR_portable.exe artifacts/GrommeR_portable.exe 2>/dev/null || true
-          fi
-          find artifacts -mindepth 2 -type f \( -name 'GrommeR_portable.exe' \) -exec cp -f {} artifacts/ \;
-          ls -la artifacts/
-
       - name: Vytvořit latest-test.json pro Tauri updater
         id: latest_json
         continue-on-error: true
         run: node scripts/create-tauri-latest-json.cjs artifacts "${{ github.ref_name }}" "https://github.com/h0nyik/GrommeR" latest-test.json
+
+      - name: Sestavit minimální sadu souborů pro Release
+        run: node scripts/prepare-release-assets.cjs artifacts release-upload latest-test.json test
 
       - name: Vytvořit pre-release pro test tag
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(artifacts/*.exe artifacts/*.exe.sig artifacts/*.msi artifacts/*.msi.sig artifacts/latest-test.json artifacts/GrommeR_portable.exe)
+          NOTES_FILE="release-notes/${{ github.ref_name }}.md"
+          if [ -f "$NOTES_FILE" ]; then
+            notes="$(cat "$NOTES_FILE")"
+          else
+            notes="**Testovací build pro auto-update** – není produkční release.
+
+          Updater endpoint: \`releases/download/updater-test/latest-test.json\`
+
+          Před tagem doporučeno doplnit \`release-notes/${{ github.ref_name }}.md\` (hlavní změny oproti předchozí test/produkční verzi)."
+          fi
+          files=(release-upload/*)
           if [ ${#files[@]} -eq 0 ]; then
             echo "Žádné soubory k nahrání do release ${{ github.ref_name }}."
             exit 1
           fi
-          notes="**Testovací build pro auto-update** – není produkční release.
-
-          Updater endpoint v tomto buildu: \`releases/download/updater-test/latest-test.json\`
-
-          | Platforma | Zdroj |
-          |-----------|--------|
-          | Windows | NSIS/MSI + \`GrommeR_portable.exe\` |
-
-          Po ověření updateru vydat produkční tag \`v*\` z \`master\`."
           if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
             gh release upload "${{ github.ref_name }}" "${files[@]}" --clobber
             gh release edit "${{ github.ref_name }}" --prerelease --title "Grommet Marks ${{ github.ref_name }} (updater test)" --notes "$notes"
@@ -159,8 +152,9 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/create-tauri-latest-json.cjs artifacts "${{ github.ref_name }}" "https://github.com/h0nyik/GrommeR" latest-test.json updater-test
-          shopt -s globstar nullglob
-          files=(artifacts/*.exe artifacts/*.exe.sig artifacts/*.msi artifacts/*.msi.sig artifacts/latest-test.json artifacts/GrommeR_portable.exe)
+          node scripts/prepare-release-assets.cjs artifacts release-upload updater latest-test.json test
+          shopt -s nullglob
+          files=(release-upload/*)
           if [ ${#files[@]} -eq 0 ]; then
             echo "Žádné soubory k nahrání do updater-test."
             exit 1

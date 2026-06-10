@@ -86,6 +86,31 @@ describe("getPageInfo", () => {
   });
 });
 
+describe("addGrommetMarksToPdf in-place (1:1)", () => {
+  it("přidá značky bez nového dokumentu při měřítku 1", async () => {
+    const bytes = await createMinimalPdf();
+    const result = await addGrommetMarksToPdf(
+      bytes,
+      {
+        widthMm: 400 * (25.4 / 72),
+        heightMm: 600 * (25.4 / 72),
+        edges: ["top"],
+        offsetXMm: 5,
+        offsetYMm: 5,
+        mode: "count",
+        countPerEdge: 2,
+      },
+      {
+        shape: "circle",
+        sizeMm: 5,
+        borderColor: { type: "rgb", r: 0, g: 0, b: 0 },
+      },
+      { drawingScale: 1 }
+    );
+    expect(result.length).toBeGreaterThan(100);
+  });
+});
+
 describe("addGrommetMarksToPdf", () => {
   it("přidá značky a vrátí platné PDF bytes", async () => {
     const bytes = await createMinimalPdf();

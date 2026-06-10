@@ -25,6 +25,8 @@ function shouldSign(filePath) {
   if (/\.exe$/i.test(base) && /setup|nsis/i.test(base)) return true;
   if (/\.msi$/i.test(base)) return true;
   if (/\.app\.tar\.gz$/i.test(base)) return true;
+  if (/setup.*\.exe\.zip$/i.test(base)) return true;
+  if (/\.msi\.zip$/i.test(base)) return true;
   return false;
 }
 

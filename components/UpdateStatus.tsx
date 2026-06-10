@@ -8,6 +8,7 @@ import {
   openExternalUrl,
   type AppRuntimeInfo,
 } from "@/lib/tauri-bridge";
+import { UpdatePromptDialog, type UpdateDialogState } from "@/components/UpdatePromptDialog";
 import type { DownloadEvent, Update } from "@tauri-apps/plugin-updater";
 
 const GITHUB_RELEASES_API = "https://api.github.com/repos/h0nyik/GrommeR/releases/latest";
@@ -134,10 +135,31 @@ export function UpdateStatus() {
       const update = await check({ timeout: 30_000 });
       updateRef.current = update;
       if (!update) return null;
-      return {
+
+      const base: AvailableUpdate = {
         version: update.version,
         notes: update.body ?? undefined,
+        releaseUrl: GITHUB_RELEASES_URL,
       };
+
+      // Manifest updateru má někdy jen generický text. Pokud poznámky chybí,
+      // doplníme je (a odkaz na vydání) z GitHub API – jeden dodatečný request.
+      if (!base.notes || !base.notes.trim()) {
+        try {
+          const gh = await checkGithubReleaseUpdate(currentVersion, "installer");
+          if (gh) {
+            return {
+              ...base,
+              notes: gh.notes ?? base.notes,
+              releaseUrl: gh.releaseUrl ?? base.releaseUrl,
+            };
+          }
+        } catch {
+          // GitHub nedostupný – necháme základní informace z manifestu.
+        }
+      }
+
+      return base;
     } catch {
       updateRef.current = null;
       const releaseUpdate = await checkGithubReleaseUpdate(currentVersion, "installer");
@@ -181,6 +203,8 @@ export function UpdateStatus() {
                 ? `Je dostupná verze ${update.version}, ale automatická instalace pro tento release není připravená.`
                 : `Je dostupná aktualizace ${update.version}.`
           );
+          // Dismiss je per-session: po každém spuštění se popup ukáže znovu,
+          // dokud uživatel verzi v této session neodmítne.
           if (getDismissedUpdateVersion() !== update.version) {
             setShowUpdateDialog(true);
           }
@@ -209,8 +233,10 @@ export function UpdateStatus() {
       return;
     }
 
+    // Portable / ruční stažení: otevřeme prohlížeč a popup zavřeme.
     if (mode === "portable" || availableUpdate.manualDownload) {
       await openExternalUrl(availableUpdate.downloadUrl ?? availableUpdate.releaseUrl ?? GITHUB_RELEASES_URL);
+      setShowUpdateDialog(false);
       return;
     }
 
@@ -221,7 +247,7 @@ export function UpdateStatus() {
     }
 
     installInProgressRef.current = true;
-    setShowUpdateDialog(false);
+    // Popup necháme otevřený – průběh stahování ukážeme přímo v něm.
     setState("downloading");
     setMessage("Stahuji aktualizaci…");
     setProgress(null);
@@ -256,7 +282,6 @@ export function UpdateStatus() {
       installInProgressRef.current = false;
       setState("error");
       setMessage(error instanceof Error ? error.message : "Instalace aktualizace selhala.");
-      setShowUpdateDialog(true);
     }
   }, [availableUpdate, checkForUpdates, mode]);
 
@@ -265,6 +290,10 @@ export function UpdateStatus() {
       dismissUpdateVersion(availableUpdate.version);
     }
     setShowUpdateDialog(false);
+  }, [availableUpdate]);
+
+  const handleOpenReleasePage = useCallback(() => {
+    void openExternalUrl(availableUpdate?.releaseUrl ?? GITHUB_RELEASES_URL);
   }, [availableUpdate]);
 
   const handlePrimaryAction = useCallback(async () => {
@@ -278,6 +307,9 @@ export function UpdateStatus() {
   if (state === "hidden") return null;
 
   const currentVersion = runtimeInfo?.version ?? packageJson.version;
+  const dialogState: UpdateDialogState =
+    state === "downloading" ? "downloading" : state === "error" ? "error" : "available";
+
   const buttonLabel =
     state === "available"
       ? mode === "portable"
@@ -299,70 +331,43 @@ export function UpdateStatus() {
           {message ? ` · ${message}` : ""}
           {progress != null ? ` (${progress} %)` : ""}
         </span>
-        <button
-          type="button"
-          onClick={handlePrimaryAction}
-          disabled={state === "checking" || state === "downloading"}
-          className="underline hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:text-zinc-300"
-        >
-          {buttonLabel}
-        </button>
+        {availableUpdate && !showUpdateDialog ? (
+          <button
+            type="button"
+            onClick={() => setShowUpdateDialog(true)}
+            className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-700 hover:bg-amber-100 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300 dark:hover:bg-amber-500/20"
+          >
+            <span aria-hidden>✦</span>
+            Nová verze {availableUpdate.version} – zobrazit
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={handlePrimaryAction}
+            disabled={state === "checking" || state === "downloading"}
+            className="underline hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:text-zinc-300"
+          >
+            {buttonLabel}
+          </button>
+        )}
       </div>
 
-      {showUpdateDialog && availableUpdate && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
-          onClick={handleDismissUpdate}
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="update-dialog-title"
-        >
-          <div
-            className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-lg border border-zinc-200 bg-white p-5 shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 id="update-dialog-title" className="text-lg font-semibold text-zinc-800 dark:text-zinc-100">
-              Dostupná aktualizace
-            </h2>
-            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
-              Je k dispozici nová verze <strong>{availableUpdate.version}</strong>.
-              {currentVersion ? ` Aktuálně máte verzi ${currentVersion}.` : ""}
-            </p>
-            {availableUpdate.notes ? (
-              <p className="mt-3 whitespace-pre-wrap rounded border border-zinc-200 bg-zinc-50 p-3 text-sm text-zinc-600 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
-                {availableUpdate.notes}
-              </p>
-            ) : null}
-            {state === "error" ? (
-              <p className="mt-3 text-sm text-red-600 dark:text-red-400">{message}</p>
-            ) : null}
-            <div className="mt-5 flex flex-wrap justify-end gap-2">
-              <button
-                type="button"
-                onClick={handleDismissUpdate}
-                disabled={state === "downloading"}
-                className="rounded border border-zinc-300 px-4 py-2 text-sm text-zinc-700 hover:bg-zinc-50 disabled:opacity-60 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-800"
-              >
-                Později
-              </button>
-              <button
-                type="button"
-                onClick={() => void installUpdate()}
-                disabled={state === "downloading"}
-                className="rounded bg-zinc-800 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-60 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white"
-              >
-                {state === "downloading"
-                  ? progress != null
-                    ? `Stahuji… ${progress} %`
-                    : "Instaluji…"
-                  : mode === "portable" || availableUpdate.manualDownload
-                    ? "Stáhnout"
-                    : "Aktualizovat nyní"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {showUpdateDialog && availableUpdate ? (
+        <UpdatePromptDialog
+          version={availableUpdate.version}
+          currentVersion={currentVersion}
+          notes={availableUpdate.notes}
+          mode={mode}
+          manualDownload={availableUpdate.manualDownload}
+          state={dialogState}
+          progress={progress}
+          errorMessage={state === "error" ? message : undefined}
+          releaseUrl={availableUpdate.releaseUrl}
+          onInstall={() => void installUpdate()}
+          onDismiss={handleDismissUpdate}
+          onOpenReleasePage={handleOpenReleasePage}
+        />
+      ) : null}
     </>
   );
 }

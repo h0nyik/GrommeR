@@ -3,6 +3,8 @@
  * <BASE>__<SIRKA>x<VYSKA><jednotka>__GS<SPACING>__TISK.pdf
  */
 
+import { stripInputExtension } from "./input-formats";
+
 const MAX_BASE_LENGTH = 25;
 const SAFE_BASE_REGEX = /[^a-zA-Z0-9_-]/g;
 const SUFFIX_REGEX = /\s*[-_]?\s*(final|export|verze|v\d+|rev\d*)\s*$/i;
@@ -25,7 +27,7 @@ function removeDiacritics(s: string): string {
  * odstraní příponu .pdf, suffixy (final, export, v3…), zkrátí, nahradí diakritiku a nebezpečné znaky.
  */
 export function sanitizeBaseName(originalFileName: string): string {
-  let base = originalFileName.replace(/\.pdf$/i, "").trim();
+  let base = stripInputExtension(originalFileName);
   let prev = "";
   while (prev !== base) {
     prev = base;

@@ -60,14 +60,24 @@ export type OpenFilesResult = {
   files: File[];
   paths: string[];
   defaultSaveDir: string;
+  /** Bajty načtené při importu (stejné pořadí jako files) – bez druhého čtení v UI. */
+  preloadedBytes: Uint8Array[];
 };
 
+/**
+ * Průběh importu (čtení souborů ze zdroje, typicky pomalé u velkých grafik ze sítě).
+ * Hlásí, kolikátý soubor z celkového počtu se právě načítá.
+ */
+export interface ImportProgress {
+  current: number;
+  total: number;
+  fileName: string;
+}
+
+import { getMimeFromFilename, getTauriFileExtensions } from "./input-formats";
+
 function getMimeTypeFromPath(pathStr: string): string {
-  const name = pathStr.toLowerCase();
-  if (name.endsWith(".pdf")) return "application/pdf";
-  if (name.endsWith(".png")) return "image/png";
-  if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
-  return "application/octet-stream";
+  return getMimeFromFilename(pathStr) ?? "application/octet-stream";
 }
 
 function getDirnameFromPath(pathStr: string): string {
@@ -75,29 +85,89 @@ function getDirnameFromPath(pathStr: string): string {
   return lastSep >= 0 ? pathStr.slice(0, lastSep) : "";
 }
 
-async function filesFromPaths(selectedPaths: string[]): Promise<OpenFilesResult> {
+async function filesFromPaths(
+  selectedPaths: string[],
+  onProgress?: (progress: ImportProgress) => void
+): Promise<OpenFilesResult> {
   const files: File[] = [];
+  const preloadedBytes: Uint8Array[] = [];
   const filePaths: string[] = [];
   let defaultSaveDir = "";
-  for (let i = 0; i < selectedPaths.length; i++) {
-    const pathStr = selectedPaths[i];
-    if (!pathStr) continue;
+  const validPaths = selectedPaths.filter(Boolean);
+  for (let i = 0; i < validPaths.length; i++) {
+    const pathStr = validPaths[i];
     filePaths.push(pathStr);
     if (i === 0) defaultSaveDir = getDirnameFromPath(pathStr);
+    const name = pathStr.replace(/^.*[\\/]/, "");
+    // Ohlásíme začátek čtení tohoto souboru (důležité u velkých grafik ze sítě).
+    onProgress?.({ current: i + 1, total: validPaths.length, fileName: name });
     // Čtení přes nativní Rust příkaz – funguje i pro síťové/UNC cesty mimo fs scope.
     const buffer = await invokeCore<ArrayBuffer>("read_file_bytes", { path: pathStr });
     const bytes = new Uint8Array(buffer);
-    const name = pathStr.replace(/^.*[\\/]/, "");
+    preloadedBytes.push(bytes);
     files.push(new File([bytes], name, { type: getMimeTypeFromPath(pathStr) }));
   }
-  return { files, paths: filePaths, defaultSaveDir };
+  return { files, paths: filePaths, defaultSaveDir, preloadedBytes };
+}
+
+/**
+ * Zapíše bajty do výstupní složky (bez Blob.arrayBuffer – méně kopií u velkých PDF).
+ */
+export async function saveBytesToFolder(
+  bytes: Uint8Array,
+  outputFolder: string,
+  suggestedName: string,
+  overwriteStrategy: OverwriteStrategy = "overwrite"
+): Promise<string | null> {
+  if (!isTauri()) return null;
+  const targetPath = await resolveOutputFilePath(
+    outputFolder,
+    suggestedName,
+    overwriteStrategy
+  );
+  if (!targetPath) return null;
+  await invokeCore<void>("write_file_bytes", { path: targetPath, contents: bytes });
+  return targetPath;
+}
+
+/** Načte bajty souboru z disku (Tauri) – pro opětovné načtení velkých PDF bez držení v paměti UI. */
+export async function readFileBytesFromPath(path: string): Promise<Uint8Array> {
+  const buffer = await invokeCore<ArrayBuffer>("read_file_bytes", { path });
+  return new Uint8Array(buffer);
+}
+
+/**
+ * Dialog „Uložit jako“ a zápis bajtů na zvolenou cestu.
+ */
+export async function saveBytesViaTauri(
+  bytes: Uint8Array,
+  suggestedName: string,
+  defaultDir?: string | null
+): Promise<boolean> {
+  if (!isTauri()) return false;
+  const { save } = await import("@tauri-apps/plugin-dialog");
+  const sep = (defaultDir ?? "").includes("/") ? "/" : "\\";
+  const defaultPath =
+    defaultDir && defaultDir.length > 0
+      ? `${defaultDir.replace(/[/\\]*$/, "")}${sep}${suggestedName}`
+      : suggestedName;
+  const path = await save({
+    defaultPath,
+    filters: [{ name: "PDF", extensions: ["pdf"] }],
+  });
+  if (path == null) return false;
+  await invokeCore<void>("write_file_bytes", { path, contents: bytes });
+  return true;
 }
 
 /** V Tauri otevře dialog pro výběr souborů; v prohlížeči vrátí null (použijte <input type="file">). */
-export async function openFilesViaTauri(options: {
-  multiple: boolean;
-  accept?: string;
-}): Promise<OpenFilesResult | null> {
+export async function openFilesViaTauri(
+  options: {
+    multiple: boolean;
+    accept?: string;
+  },
+  onProgress?: (progress: ImportProgress) => void
+): Promise<OpenFilesResult | null> {
   if (!isTauri()) return null;
   try {
     const { open } = await import("@tauri-apps/plugin-dialog");
@@ -105,7 +175,7 @@ export async function openFilesViaTauri(options: {
       multiple: options.multiple,
       directory: false,
       filters: options.accept
-        ? [{ name: "PDF a obrázky", extensions: ["pdf", "jpg", "jpeg", "png"] }]
+        ? [{ name: "PDF a obrázky", extensions: getTauriFileExtensions() }]
         : undefined,
     });
     if (pathOrPaths == null) return null;
@@ -113,17 +183,20 @@ export async function openFilesViaTauri(options: {
     const paths = selectedPaths
       .map((p) => (typeof p === "string" ? p : (p as { path?: string }).path ?? ""))
       .filter(Boolean);
-    return filesFromPaths(paths);
+    return filesFromPaths(paths, onProgress);
   } catch {
     return null;
   }
 }
 
 /** Načte soubory podle cest z nativního Tauri drag&drop eventu. */
-export async function openDroppedPathsViaTauri(paths: string[]): Promise<OpenFilesResult | null> {
+export async function openDroppedPathsViaTauri(
+  paths: string[],
+  onProgress?: (progress: ImportProgress) => void
+): Promise<OpenFilesResult | null> {
   if (!isTauri()) return null;
   try {
-    return filesFromPaths(paths);
+    return filesFromPaths(paths, onProgress);
   } catch {
     return null;
   }
@@ -149,12 +222,27 @@ export async function chooseOutputFolderViaTauri(): Promise<string | null> {
 /** Strategie při konfliktu názvů výstupního souboru */
 export type OverwriteStrategy = "overwrite" | "skip" | "suffix";
 
-/**
- * V Tauri zapíše blob do výstupní složky podle strategie přepisu.
- * Vrátí cestu výsledného souboru nebo null pokud byl soubor přeskočen.
- */
-export async function saveBlobToFolder(
-  blob: Blob,
+export interface NativeGrommetMarksArgs {
+  inputPath: string;
+  outputPath: string;
+  positions: { x: number; y: number }[];
+  shape: "circle" | "square";
+  sizeMm: number;
+  borderColor: {
+    type: "rgb" | "cmyk";
+    r?: number;
+    g?: number;
+    b?: number;
+    c?: number;
+    m?: number;
+    y?: number;
+    k?: number;
+  };
+  borderWidthPt?: number;
+}
+
+/** Určí cílovou cestu výstupního PDF (bez zápisu). */
+export async function resolveOutputFilePath(
   outputFolder: string,
   suggestedName: string,
   overwriteStrategy: OverwriteStrategy = "overwrite"
@@ -168,7 +256,6 @@ export async function saveBlobToFolder(
     const fileExists = await invokeCore<boolean>("file_exists", { path: targetPath });
     if (fileExists) {
       if (overwriteStrategy === "skip") return null;
-      // suffix: přidej _1, _2, … před .pdf
       const dotIdx = suggestedName.lastIndexOf(".");
       const base = dotIdx >= 0 ? suggestedName.slice(0, dotIdx) : suggestedName;
       const ext = dotIdx >= 0 ? suggestedName.slice(dotIdx) : "";
@@ -181,6 +268,35 @@ export async function saveBlobToFolder(
       targetPath = candidate;
     }
   }
+
+  return targetPath;
+}
+
+/** Vloží značky do PDF nativně (lopdf) – bez načítání celého souboru do WebView. */
+export async function addGrommetMarksNative(args: NativeGrommetMarksArgs): Promise<void> {
+  if (!isTauri()) {
+    throw new Error("Nativní zpracování PDF je dostupné jen v desktopové aplikaci.");
+  }
+  await invokeCore<void>("add_grommet_marks_native", { args });
+}
+
+/**
+ * V Tauri zapíše blob do výstupní složky podle strategie přepisu.
+ * Vrátí cestu výsledného souboru nebo null pokud byl soubor přeskočen.
+ */
+export async function saveBlobToFolder(
+  blob: Blob,
+  outputFolder: string,
+  suggestedName: string,
+  overwriteStrategy: OverwriteStrategy = "overwrite"
+): Promise<string | null> {
+  if (!isTauri()) return null;
+  const targetPath = await resolveOutputFilePath(
+    outputFolder,
+    suggestedName,
+    overwriteStrategy
+  );
+  if (!targetPath) return null;
 
   const buf = await blob.arrayBuffer();
   // Zápis přes nativní Rust příkaz – obchází fs scope, funguje i na síťové disky.

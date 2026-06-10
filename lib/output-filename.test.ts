@@ -12,8 +12,11 @@ import {
 } from "./output-filename";
 
 describe("sanitizeBaseName", () => {
-  it("odstraní příponu .pdf", () => {
+  it("odstraní příponu .pdf a rastrové formáty", () => {
     expect(sanitizeBaseName("banner.pdf")).toBe("banner");
+    expect(sanitizeBaseName("banner.tif")).toBe("banner");
+    expect(sanitizeBaseName("banner.tiff")).toBe("banner");
+    expect(sanitizeBaseName("photo.jpg")).toBe("photo");
   });
 
   it("odstraní suffixy final, export, v3", () => {
@@ -75,6 +78,16 @@ describe("generateOutputFilename", () => {
       spacingCm: 30,
     });
     expect(name).toBe("banner-tisk__50x24cm__GS30__TISK.pdf");
+  });
+
+  it("odstraní příponu TIFF ze vstupního názvu", () => {
+    const name = generateOutputFilename({
+      originalFileName: "plachta-Liberec.tif",
+      widthMm: 500,
+      heightMm: 240,
+      spacingCm: 30,
+    });
+    expect(name).toBe("plachta-Liberec__50x24cm__GS30__TISK.pdf");
   });
 
   it("s metry a zkráceným základem", () => {

@@ -10,7 +10,7 @@ function getIssueTitle(description: string): string {
   const firstLine = description.trim().split(/\r?\n/)[0]?.trim();
   return firstLine
     ? `[Chyba] ${firstLine.slice(0, 80)}`
-    : "[Chyba] Grommet Marks";
+    : "[Chyba] GrommeR";
 }
 
 function getEnvInfo(): string {

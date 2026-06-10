@@ -17,6 +17,7 @@ import type { MarkPosition } from "@/types/grommet";
 import type { GrommetMarksParams, MarkColor } from "@/types/grommet";
 import type { PdfBox, PdfPageInfo } from "@/types/grommet";
 import { computeGrommetMarks } from "./grommet-marks";
+import { toFriendlyInputError } from "./input-bytes";
 
 /** Převod mm na body (points) – PDF jednotky */
 const MM_TO_PT = 72 / 25.4;
@@ -38,14 +39,12 @@ export function normalizeDrawingScale(value: number | undefined): number {
 }
 
 /** Převede neznámou výjimku na čitelný text pro UI. */
-export function extractErrorMessage(err: unknown, fallback: string): string {
-  if (err instanceof Error && err.message.trim()) return err.message;
-  if (typeof err === "string" && err.trim()) return err;
-  if (err && typeof err === "object" && "message" in err) {
-    const message = (err as { message?: unknown }).message;
-    if (typeof message === "string" && message.trim()) return message;
-  }
-  return fallback;
+export function extractErrorMessage(
+  err: unknown,
+  fallback: string,
+  fileSize?: number
+): string {
+  return toFriendlyInputError(err, fallback, fileSize);
 }
 
 /**
@@ -134,7 +133,7 @@ function addPhysicalSizePage(doc: PDFDocument, widthMm: number, heightMm: number
  * Načte PDF dokument z pole bytů (ArrayBuffer / Uint8Array).
  */
 export async function loadPdfDocument(bytes: ArrayBuffer | Uint8Array) {
-  return PDFDocument.load(bytes);
+  return PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false });
 }
 
 /**
@@ -268,6 +267,34 @@ function normalizePageBoxesToTrim(page: PDFPage): void {
 }
 
 /**
+ * Úprava na místě (1:1): bez embedPage do nového dokumentu – výrazně méně paměti u velkých PDF.
+ */
+async function addGrommetMarksInPlace(
+  pdfBytes: ArrayBuffer | Uint8Array,
+  grommetParams: GrommetMarksParams,
+  drawOptions: DrawMarkOptions
+): Promise<Uint8Array> {
+  const doc = await loadPdfDocument(pdfBytes);
+  const pages = doc.getPages();
+  if (pages.length === 0) throw new Error("PDF neobsahuje žádnou stránku.");
+
+  const page = pages[0];
+  normalizePageBoxesToTrim(page);
+
+  const info = getPageInfo(page, 0);
+  const params: GrommetMarksParams = {
+    ...grommetParams,
+    widthMm: info.widthMm,
+    heightMm: info.heightMm,
+  };
+  const { positions } = computeGrommetMarks(params);
+  drawMarksOnPage(page, positions, drawOptions);
+  normalizePageBoxesToTrim(page);
+
+  return doc.save({ useObjectStreams: false });
+}
+
+/**
  * Nový dokument: první stránka zdroje vykreslená N× větší, poté značky ve stejném souřadnicovém systému.
  */
 async function addGrommetMarksToScaledPdf(
@@ -308,7 +335,7 @@ async function addGrommetMarksToScaledPdf(
   drawMarksOnPage(page, positions, drawOptions);
   normalizePageBoxesToTrim(page);
 
-  return outDoc.save();
+  return outDoc.save({ useObjectStreams: false });
 }
 
 /**
@@ -325,7 +352,31 @@ export async function addGrommetMarksToPdf(
   options?: AddGrommetMarksToPdfOptions
 ): Promise<Uint8Array> {
   const scale = normalizeDrawingScale(options?.drawingScale);
-  // Vždy nový dokument: spolehlivější u velkých plachet a PDF z DTP (bleed, UserUnit, složité boxy).
+  const useInPlace = scale === 1 && !options?.targetSizeMm;
+
+  if (useInPlace) {
+    try {
+      return await addGrommetMarksInPlace(pdfBytes, grommetParams, drawOptions);
+    } catch (inPlaceErr) {
+      const msg = extractErrorMessage(inPlaceErr, "");
+      // Složité DTP PDF (UserUnit, bleed…) – zkusíme cestu přes nový dokument.
+      if (msg && !msg.includes("Invalid array length") && !msg.includes("příliš velk")) {
+        try {
+          return await addGrommetMarksToScaledPdf(
+            pdfBytes,
+            grommetParams,
+            drawOptions,
+            1,
+            undefined
+          );
+        } catch {
+          throw inPlaceErr;
+        }
+      }
+      throw inPlaceErr;
+    }
+  }
+
   return addGrommetMarksToScaledPdf(
     pdfBytes,
     grommetParams,

@@ -191,6 +191,16 @@ Pokrytí: výpočet pozic značek, práce s PDF, generátor názvů, převod obr
 
 ---
 
+## Release (GitHub)
+
+Produkční verze se označí tagem `v*` (např. `v1.2.0`). CI sestaví instalátory, vytvoří `latest.json` pro automatickou aktualizaci a publikuje [GitHub Release](https://github.com/h0nyik/GrommeR/releases).
+
+**Před pushem tagu** vždy přidejte soubor `release-notes/v1.2.0.md` se stručným přehledem hlavních změn oproti předchozí verzi (šablona: `release-notes/TEMPLATE.md`). Bez něj release vznikne s upozorněním v popisu.
+
+Na každém release jsou jen soubory pro stažení a auto-update (žádné `.sig`, žádné vnitřní soubory z buildu): `latest.json`, Windows (NSIS + MSI + portable), případně AppImage a macOS DMG; soubor `*.app.tar.gz` na macOS je jen pro automatickou aktualizaci. Výběr dělá CI skript `scripts/prepare-release-assets.cjs`.
+
+---
+
 ## Přispívání
 
 1. Forkněte repozitář

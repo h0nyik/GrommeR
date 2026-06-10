@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Grommet Marks App",
+  title: "GrommeR",
   description:
     "Nástroj pro generování značek pro průchodky do tiskových PDF bannerů.",
 };

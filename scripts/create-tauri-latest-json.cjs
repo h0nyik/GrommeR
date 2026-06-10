@@ -51,11 +51,9 @@ function pickSignedAsset(files, matcher, prefer) {
 
 const files = walk(artifactsDir);
 const platformAssets = {
-  "windows-x86_64": pickSignedAsset(
-    files,
-    /^(?!.*portable).*\.exe$/i,
-    /setup|nsis/i
-  ),
+  "windows-x86_64":
+    pickSignedAsset(files, /setup.*\.exe\.zip$/i, /nsis/i) ||
+    pickSignedAsset(files, /^(?!.*portable).*\.exe$/i, /setup|nsis/i),
   "linux-x86_64": pickSignedAsset(files, /\.AppImage$/i),
   "darwin-aarch64": pickSignedAsset(files, /\.app\.tar\.gz$/i),
 };
@@ -84,9 +82,33 @@ function normalizeTagVersion(tag) {
   return tag.replace(/^test-v/i, "").replace(/^v/i, "");
 }
 
+/**
+ * Načte uživatelské release poznámky z `release-notes/<tag>.md` (pokud existují)
+ * a vrátí je jako text pro pole `notes` v manifestu updateru. Tyto poznámky
+ * pak instalovaná aplikace zobrazí v úvodním popupu jako "lákadla" novinek.
+ *
+ * Soubor v repu obsahuje jen samotné poznámky (bez patičky "Stažení", kterou
+ * přidává až GitHub Release workflow), takže ho stačí načíst a oříznout bílé znaky.
+ * Pro jistotu odstraníme i případnou patičku za vodorovnou čarou "---".
+ */
+function readReleaseNotes(tag) {
+  const candidates = [
+    path.resolve(process.cwd(), "release-notes", `${tag}.md`),
+    path.resolve(__dirname, "..", "release-notes", `${tag}.md`),
+  ];
+  for (const notesPath of candidates) {
+    if (!fs.existsSync(notesPath)) continue;
+    const raw = fs.readFileSync(notesPath, "utf8");
+    // Oddělíme případnou patičku ("## Stažení" nebo samostatné "---" před ní).
+    const trimmed = raw.split(/\n---\s*\n/)[0].split(/\n##\s+Stažení/i)[0].trim();
+    if (trimmed) return trimmed;
+  }
+  return `Nová verze ${tag}. Podrobnosti najdete na stránce vydání na GitHubu.`;
+}
+
 const manifest = {
   version: normalizeTagVersion(tagName),
-  notes: `Automatická aktualizace ${tagName}.`,
+  notes: readReleaseNotes(tagName),
   pub_date: new Date().toISOString(),
   platforms,
 };

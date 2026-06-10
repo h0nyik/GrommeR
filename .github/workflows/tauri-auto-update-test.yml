@@ -61,8 +61,12 @@ jobs:
       - name: Install JS dependencies
         run: npm ci
 
+      # Stejný požadavek jako produkční build – createUpdaterArtifacts vyžaduje klíč u tauri build.
       - name: Build Tauri app (test updater endpoint)
         run: npm run tauri build -- --config src-tauri/tauri.test.conf.json
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Podepsat updater artefakty (test tag)
         if: startsWith(github.ref, 'refs/tags/test-v')

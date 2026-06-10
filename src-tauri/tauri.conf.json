@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Grommet Marks",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "identifier": "cz.grommet.marksapp",
   "build": {
     "frontendDist": "../out",
@@ -28,7 +28,7 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
-    "targets": ["app", "dmg", "nsis", "msi"],
+    "targets": ["app", "dmg", "nsis", "msi", "appimage"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
